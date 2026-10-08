@@ -6,3 +6,11 @@ data_cache/
 __pycache__/
 *.pyc
 .DS_Store
+targets/
+
+# Local runtime config — never commit real API keys
+# Copy config.example.json → config.json and fill in your keys locally
+config.json
+credentials.json
+.env
+.env.local

@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 REPO_ROOT = Path(__file__).resolve().parent
 DB_PATH = REPO_ROOT / "scan4me.db"
 CONFIG_PATH = REPO_ROOT / "config.json"
+CONFIG_EXAMPLE_PATH = REPO_ROOT / "config.example.json"
 CACHE_DATA_DIR = REPO_ROOT / "data_cache"
 
 UPSTREAM_REPO = "https://github.com/arkadiyt/bounty-targets-data.git"
@@ -378,12 +379,18 @@ DEFAULT_CONFIG = {
 }
 
 def load_config():
-    if CONFIG_PATH.exists():
-        try:
-            with open(CONFIG_PATH) as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"[!] Warning: Failed to load config.json ({e}), using defaults.")
+    # Priority: config.json (local, git-ignored) → config.example.json → DEFAULT_CONFIG
+    for path in (CONFIG_PATH, CONFIG_EXAMPLE_PATH):
+        if path.exists():
+            try:
+                with open(path) as f:
+                    cfg = json.load(f)
+                if path == CONFIG_EXAMPLE_PATH:
+                    print(f"[*] config.json not found — using {path.name} (template). "
+                          "Copy it to config.json and set your API keys.")
+                return cfg
+            except Exception as e:
+                print(f"[!] Warning: Failed to load {path.name} ({e}), trying next.")
     return DEFAULT_CONFIG
 
 def get_db():
