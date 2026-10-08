@@ -1,12 +1,12 @@
 # 🎯 Scan4Me: Precision Bug Bounty Intelligence & Scope Targeter
 
-**Scan4Me** is an automated bug bounty target selection engine built for white-hat hackers who prioritize:
-1. **⚡ Fast Triage Speeds**: Security teams that respond in hours (not months), with high response efficiency (>80%).
+**Scan4Me** is an automated bug bounty target selection engine built for authorized researchers who prioritize:
+1. **⚡ Fast Triage Signals**: Measured average first-response times are available in the HackerOne feed; managed triage on other platforms is not a response-time measurement.
 2. **🌐 Massive Attack Surface**: Companies with extensive scope (`*.domain.com` wildcards and microservices)—**more assets means more surface area to find bugs**.
 3. **💰 Fast Cash & High Payouts**: Strict filtering for paid BBP programs and verified bounty pools.
-4. **🌿 Low Report Saturation**: Fresh programs and targets with lower past backlog to minimize duplicate submissions.
+4. **🆕 Official Program/Scope History**: Bugcrowd enrichment reads published program start dates and versioned scope history. Other feeds are not labeled with official dates until platform-specific adapters are added.
 
-It indexes over **47,000+ assets** across **HackerOne**, **Bugcrowd**, **Intigriti**, and **YesWeHack** into a local SQLite database that queries in milliseconds offline.
+It indexes programs and assets from **HackerOne**, **Bugcrowd**, **Intigriti**, and **YesWeHack**. Bugcrowd public statistics include rewarded-vulnerability totals, historical average payout, and validation time; those are useful competition/triage signals, but rewarded totals are not counts of open or resolved reports.
 
 ---
 
@@ -56,34 +56,36 @@ flowchart TD
 
 ## 🚀 Usage Guide
 
-### 1. Synchronize Live Feeds
-Sync your local database with upstream intelligence:
+### 1. Refresh Feeds and Sync
+Fetch the latest upstream snapshot and update the local database:
 ```bash
 python3 scan4me.py sync
 ```
 
+For offline operation against the last cached snapshot:
+```bash
+python3 scan4me.py sync --offline
+```
+
+The first sync establishes an observation baseline. Use the enrichment command for Bugcrowd's actual program and scope dates:
+```bash
+python3 scan4me.py enrich --limit 30
+```
+
 ### 2. Run Precision Target Radar
-Display companies ranked by attack surface size and fast triage SLA:
+Display companies ranked by surface and available triage evidence:
 ```bash
 python3 scan4me.py radar --limit 10
 ```
 
-**Sample Output:**
-```text
-[01] ★ SCORE: 92.8/100 | 🔥 MASSIVE SURFACE | [HackerOne] Flutter UK&I
-     🏢 Company Info : Policy: https://hackerone.com/flutteruki
-                       Website: https://www.flutter.com/our-business/our-divisions
-     ⚡ Triage Speed  : 3.0h (Eff: 94.0%) | 💰 Payout: Paid BBP
-     🌐 Surface Scope : 44 In-Scope Assets (36 Wildcards) | Harbor: Standard
-     🔎 Target Sample : *.betfair.com, *.betfair.es, *.betfair.it
-----------------------------------------------------------------------------------------
-[02] ★ SCORE: 92.2/100 | 🔥 MASSIVE SURFACE | [HackerOne] Cloudflare Public Bug Bounty
-     🏢 Company Info : Policy: https://hackerone.com/cloudflare
-                       Website: https://www.cloudflare.com/disclosure
-     ⚡ Triage Speed  : 1.0h (Eff: 86.0%) | 💰 Payout: Paid BBP
-     🌐 Surface Scope : 51 In-Scope Assets (3 Wildcards) | Harbor: Standard
-     🔎 Target Sample : *.cloudflare.com, *.cloudflarepartners.com, *.teams.cloudflare.com
+Filter using official Bugcrowd program/scope dates and its public metrics:
+```bash
+python3 scan4me.py radar --new-companies --new-company-days 90
+python3 scan4me.py radar --new-assets --new-asset-days 30
+python3 scan4me.py radar --max-validation-days 14 --max-rewarded-vulnerabilities 100
 ```
+
+`--new-companies` and `--new-assets` currently use official Bugcrowd start/scope history; platforms without an implemented source adapter are excluded by those filters rather than guessed. `--max-validation-days` uses Bugcrowd's published validation statistic. `--max-rewarded-vulnerabilities` is a historical competition proxy, not a resolved-report count. Use `--require-measured-triage` to require HackerOne first-response data or Bugcrowd validation data.
 
 ### 3. Verify Legal Scope Before Probing
 Check whether a target URL or domain is legally authorized:
@@ -112,7 +114,9 @@ Tune your hunting criteria:
       "max_first_response_hours": 48.0,
       "min_response_efficiency_pct": 80.0,
       "prefer_managed_triage": true,
-      "max_time_to_bounty_awarded_hours": 720.0
+      "max_time_to_bounty_awarded_hours": 720.0,
+      "require_measured_response_time": false,
+      "max_validation_days": null
     },
     "attack_surface_and_scope": {
       "prefer_large_attack_surface": true,
@@ -122,7 +126,12 @@ Tune your hunting criteria:
     },
     "freshness_and_competition": {
       "prefer_fresh_programs": true,
-      "low_report_saturation": true
+      "prefer_new_companies": false,
+      "new_company_days": 90,
+      "prefer_new_assets": false,
+      "new_asset_days": 30,
+      "low_report_saturation": false,
+      "max_rewarded_vulnerabilities": null
     },
     "payouts": {
       "min_max_payout_usd": 1000.0,
