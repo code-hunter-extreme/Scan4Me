@@ -2,7 +2,8 @@
 """
 Scan4Me: Precision Bug Bounty Intelligence & Scope Targeter
 Filters 47,000+ assets across HackerOne, Bugcrowd, Intigriti, and YesWeHack
-specifically for fast triage, fresh assets, low report saturation, and fast payouts.
+specifically for fast triage, massive attack surface (more assets = more bugs),
+fresh scope, low report saturation, and fast payouts.
 """
 
 import sys
@@ -12,14 +13,12 @@ import sqlite3
 import argparse
 import subprocess
 from pathlib import Path
-from urllib.request import urlopen, Request
 
 REPO_ROOT = Path(__file__).resolve().parent
 DB_PATH = REPO_ROOT / "scan4me.db"
 CONFIG_PATH = REPO_ROOT / "config.json"
 CACHE_DATA_DIR = REPO_ROOT / "data_cache"
 
-# Upstream feeds
 UPSTREAM_REPO = "https://github.com/arkadiyt/bounty-targets-data.git"
 
 DEFAULT_CONFIG = {
@@ -32,11 +31,15 @@ DEFAULT_CONFIG = {
             "prefer_managed_triage": True,
             "max_time_to_bounty_awarded_hours": 720.0
         },
+        "attack_surface_and_scope": {
+            "prefer_large_attack_surface": True,
+            "min_in_scope_assets": 1,
+            "prioritize_wildcards": True,
+            "wildcard_multiplier": 2.5
+        },
         "freshness_and_competition": {
             "prefer_fresh_programs": True,
-            "low_report_saturation": True,
-            "min_in_scope_assets": 1,
-            "require_wildcards": False
+            "low_report_saturation": True
         },
         "payouts": {
             "min_max_payout_usd": 1000.0,
@@ -50,12 +53,14 @@ DEFAULT_CONFIG = {
         "yeswehack": True
     },
     "ranking_weights": {
-        "triage_speed": 0.40,
-        "freshness_and_low_saturation": 0.35,
-        "payout_size": 0.25
+        "triage_speed": 0.35,
+        "attack_surface_size": 0.30,
+        "freshness_and_low_saturation": 0.20,
+        "payout_size": 0.15
     },
     "display": {
         "limit": 25,
+        "show_company_profile": True,
         "show_assets_sample": True
     }
 }
@@ -83,6 +88,7 @@ def init_db(conn):
             name TEXT NOT NULL,
             handle TEXT,
             url TEXT,
+            website TEXT,
             offers_bounties BOOLEAN DEFAULT 0,
             managed_triage BOOLEAN DEFAULT 0,
             first_response_hours REAL,
@@ -92,7 +98,6 @@ def init_db(conn):
             max_payout REAL DEFAULT 0,
             currency TEXT DEFAULT 'USD',
             safe_harbor TEXT,
-            raw_json TEXT,
             UNIQUE(platform, handle)
         );
 
@@ -115,7 +120,6 @@ def sync_data(clone_if_missing=True):
     local_data_dir = CACHE_DATA_DIR / "data"
 
     if not local_data_dir.exists() or not (local_data_dir / "hackerone_data.json").exists():
-        # Check if scratch repo already cloned in parent workspace
         shared_scratch = Path("/home/phantomcore/.gemini/antigravity-cli/brain/025773d3-1a4b-4d6a-9674-a58515d9bcd7/scratch/bounty-targets-data/data")
         if shared_scratch.exists():
             print(f"[*] Copying latest datasets from local cache: {shared_scratch}")
@@ -142,6 +146,7 @@ def sync_data(clone_if_missing=True):
                 handle = p.get("handle")
                 name = p.get("name") or handle
                 url = f"https://hackerone.com/{handle}"
+                website = p.get("website") or ""
                 offers_bounty = bool(p.get("offers_bounties"))
                 managed = bool(p.get("managed_program"))
                 resp_time = p.get("average_time_to_first_program_response")
@@ -151,11 +156,11 @@ def sync_data(clone_if_missing=True):
 
                 cur.execute("""
                     INSERT OR REPLACE INTO programs (
-                        platform, name, handle, url, offers_bounties, managed_triage,
+                        platform, name, handle, url, website, offers_bounties, managed_triage,
                         first_response_hours, bounty_awarded_hours, report_resolved_hours,
                         response_efficiency, currency
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'USD')
-                """, ("HackerOne", name, handle, url, offers_bounty, managed, resp_time, bounty_time, resolved_time, efficiency))
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'USD')
+                """, ("HackerOne", name, handle, url, website, offers_bounty, managed, resp_time, bounty_time, resolved_time, efficiency))
                 
                 prog_id = cur.lastrowid or conn.execute("SELECT id FROM programs WHERE platform=? AND handle=?", ("HackerOne", handle)).fetchone()[0]
                 
@@ -182,13 +187,13 @@ def sync_data(clone_if_missing=True):
                 max_p = float(p.get("max_payout", 0) or 0)
                 offers_bounty = max_p > 0
                 managed = bool(p.get("managed_by_bugcrowd"))
-                safe = p.get("safe_harbor", "unknown")
+                safe = p.get("safe_harbor", "Standard")
 
                 cur.execute("""
                     INSERT OR REPLACE INTO programs (
-                        platform, name, handle, url, offers_bounties, managed_triage,
+                        platform, name, handle, url, website, offers_bounties, managed_triage,
                         max_payout, currency, safe_harbor
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', ?)
+                    ) VALUES (?, ?, ?, ?, '', ?, ?, ?, 'USD', ?)
                 """, ("Bugcrowd", name, handle, url, offers_bounty, managed, max_p, safe))
 
                 prog_id = cur.lastrowid or conn.execute("SELECT id FROM programs WHERE platform=? AND handle=?", ("Bugcrowd", handle)).fetchone()[0]
@@ -217,9 +222,9 @@ def sync_data(clone_if_missing=True):
 
                 cur.execute("""
                     INSERT OR REPLACE INTO programs (
-                        platform, name, handle, url, offers_bounties, managed_triage,
+                        platform, name, handle, url, website, offers_bounties, managed_triage,
                         max_payout, currency
-                    ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                    ) VALUES (?, ?, ?, ?, '', ?, 1, ?, ?)
                 """, ("Intigriti", name, handle, url, offers_bounty, max_val, curr))
 
                 prog_id = cur.lastrowid or conn.execute("SELECT id FROM programs WHERE platform=? AND handle=?", ("Intigriti", handle)).fetchone()[0]
@@ -246,9 +251,9 @@ def sync_data(clone_if_missing=True):
 
                 cur.execute("""
                     INSERT OR REPLACE INTO programs (
-                        platform, name, handle, url, offers_bounties, managed_triage,
+                        platform, name, handle, url, website, offers_bounties, managed_triage,
                         max_payout, currency
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'EUR')
+                    ) VALUES (?, ?, ?, ?, '', ?, ?, ?, 'EUR')
                 """, ("YesWeHack", name, handle, f"https://yeswehack.com/programs/{handle}", offers_bounty, managed, max_val))
 
                 prog_id = cur.lastrowid or conn.execute("SELECT id FROM programs WHERE platform=? AND handle=?", ("YesWeHack", handle)).fetchone()[0]
@@ -265,17 +270,22 @@ def sync_data(clone_if_missing=True):
     total_wild = cur.execute("SELECT count(*) FROM assets WHERE is_wildcard=1").fetchone()[0]
     print(f"\n[✓] Scan4Me Sync Complete: {total_progs} programs, {total_assets} assets ({total_wild} wildcards).")
 
-def evaluate_fast_cash():
+def evaluate_targets():
     config = load_config()
     conn = get_db()
     cur = conn.cursor()
 
     filters = config.get("filters", {})
     fast_triage = filters.get("fast_triage", {})
-    fresh = filters.get("freshness_and_competition", {})
-    payouts = filters.get("payouts", {})
+    surface_cfg = filters.get("attack_surface_and_scope", {})
+    fresh_cfg = filters.get("freshness_and_competition", {})
     plat_cfg = config.get("platforms", {})
-    weights = config.get("ranking_weights", {"triage_speed": 0.4, "freshness_and_low_saturation": 0.35, "payout_size": 0.25})
+    weights = config.get("ranking_weights", {
+        "triage_speed": 0.35,
+        "attack_surface_size": 0.30,
+        "freshness_and_low_saturation": 0.20,
+        "payout_size": 0.15
+    })
 
     enabled_plats = [p for p, enabled in plat_cfg.items() if enabled]
     plat_map = {
@@ -303,30 +313,27 @@ def evaluate_fast_cash():
     scored_programs = []
     max_first_resp = fast_triage.get("max_first_response_hours", 48.0)
     min_efficiency = fast_triage.get("min_response_efficiency_pct", 80.0)
+    wildcard_mult = surface_cfg.get("wildcard_multiplier", 2.5)
 
     for r in rows:
-        # Filter check:
-        # Triage speed checks
+        # Triage speed filters
         if r["platform"] == "HackerOne":
             if r["first_response_hours"] is not None and r["first_response_hours"] > max_first_resp:
                 continue
             if r["response_efficiency"] is not None and r["response_efficiency"] < min_efficiency:
                 continue
 
-        # Asset checks
         asset_count = r["asset_count"] or 0
         wild_count = r["wildcard_count"] or 0
-        if asset_count < fresh.get("min_in_scope_assets", 1):
-            continue
-        if fresh.get("require_wildcards", False) and wild_count == 0:
+        
+        # Scope filters
+        if asset_count < surface_cfg.get("min_in_scope_assets", 1):
             continue
 
-        # Scoring
-        # 1. Speed score (0-100)
+        # 1. Triage Speed Score (0-100)
         speed_score = 50.0
         if r["platform"] == "HackerOne":
             if r["first_response_hours"] is not None:
-                # 0 hrs = 100 pts, 48 hrs = 50 pts, >48 = lower
                 speed_score = max(0, 100 - (r["first_response_hours"] * 1.5))
             if r["managed_triage"]:
                 speed_score += 15
@@ -334,18 +341,41 @@ def evaluate_fast_cash():
             speed_score = 85.0 if r["managed_triage"] else 65.0
         speed_score = min(100.0, speed_score)
 
-        # 2. Freshness & Low Saturation Score (0-100)
-        # Low reported resolved hours or None means fresh/low past report backlog
+        # 2. Attack Surface Score (0-100) - "More Assets is Better, More Surface Area"
+        # Each asset gives 1.5 pts, each wildcard gives (1.5 * wildcard_mult) ~ 3.75 pts
+        effective_surface = asset_count + (wild_count * wildcard_mult)
+        if effective_surface >= 40:
+            surface_score = 100.0
+        elif effective_surface >= 20:
+            surface_score = 85.0
+        elif effective_surface >= 10:
+            surface_score = 70.0
+        elif effective_surface >= 5:
+            surface_score = 50.0
+        else:
+            surface_score = 25.0
+
+        # Tier labeling
+        if wild_count >= 10 or asset_count >= 30:
+            surface_tier = "🔥 MASSIVE SURFACE"
+        elif wild_count >= 3 or asset_count >= 10:
+            surface_tier = "⚡ WIDE SURFACE"
+        elif wild_count >= 1 or asset_count >= 3:
+            surface_tier = "🎯 MODERATE"
+        else:
+            surface_tier = "🔍 NARROW/FOCUSED"
+
+        # 3. Freshness & Low Saturation Score (0-100)
         fresh_score = 60.0
         if r["platform"] == "HackerOne":
             if r["report_resolved_hours"] is None:
-                fresh_score = 90.0 # Brand new / low reports
+                fresh_score = 90.0 # Brand new / low past backlog
             else:
                 fresh_score = max(20.0, 80.0 - (r["report_resolved_hours"] / 10.0))
         else:
             fresh_score = 75.0
 
-        # 3. Payout score (0-100)
+        # 4. Payout Score (0-100)
         payout_score = 50.0
         max_p = r["max_payout"] or 0
         if max_p > 0:
@@ -358,11 +388,12 @@ def evaluate_fast_cash():
             else:
                 payout_score = 55.0
         elif r["offers_bounties"]:
-            payout_score = 65.0 # HackerOne BBPs that don't publish explicit max
+            payout_score = 65.0
 
-        # Composite Fast-Money Score
+        # Composite Fast-Money & Surface Area Score
         total_score = (
             (speed_score * weights["triage_speed"]) +
+            (surface_score * weights["attack_surface_size"]) +
             (fresh_score * weights["freshness_and_low_saturation"]) +
             (payout_score * weights["payout_size"])
         )
@@ -371,13 +402,18 @@ def evaluate_fast_cash():
             "name": r["name"],
             "platform": r["platform"],
             "url": r["url"],
+            "website": r["website"],
+            "safe_harbor": r["safe_harbor"] or "Standard",
             "score": round(total_score, 1),
             "speed_score": round(speed_score, 1),
+            "surface_score": round(surface_score, 1),
             "fresh_score": round(fresh_score, 1),
             "payout_score": round(payout_score, 1),
+            "surface_tier": surface_tier,
             "max_payout": r["max_payout"],
             "currency": r["currency"],
             "first_resp": r["first_response_hours"],
+            "efficiency": r["response_efficiency"],
             "managed": bool(r["managed_triage"]),
             "assets": asset_count,
             "wildcards": wild_count,
@@ -388,30 +424,35 @@ def evaluate_fast_cash():
     return scored_programs
 
 def cmd_filter(args):
-    results = evaluate_fast_cash()
+    results = evaluate_targets()
     limit = args.limit or load_config().get("display", {}).get("limit", 20)
     
-    print("\n" + "="*80)
-    print("🔥 SCAN4ME PRECISION TARGET RADAR (FAST TRIAGE • FRESH ASSETS • FAST CASH)")
-    print("="*80)
-    print(f"[*] Showing Top {min(limit, len(results))} matching programs ranked by Fast-Money Score:\n")
+    print("\n" + "="*88)
+    print("🔥 SCAN4ME PRECISION TARGET RADAR (FAST TRIAGE • MASSIVE ATTACK SURFACE • FAST CASH)")
+    print("="*88)
+    print(f"[*] Displaying Top {min(limit, len(results))} Target Companies (Ranked by Surface & Speed):\n")
 
     conn = get_db()
     for i, p in enumerate(results[:limit], 1):
-        triage_info = f"Resp: {p['first_resp']}h" if p["first_resp"] is not None else ("Managed Team" if p["managed"] else "Standard")
+        triage_info = f"{p['first_resp']}h (Eff: {p['efficiency']}%)" if p["first_resp"] is not None else ("Managed Team" if p["managed"] else "Standard")
         payout_str = f"Max: {p['max_payout']:,.0f} {p['currency']}" if (p['max_payout'] and p['max_payout'] > 0) else "Paid BBP"
         
-        print(f"[{i:02d}] ★ SCORE: {p['score']}/100 | [{p['platform']}] {p['name']}")
-        print(f"     🔗 URL: {p['url']}")
-        print(f"     ⚡ Triage: {triage_info} | 💰 Payout: {payout_str}")
-        print(f"     🎯 Scope: {p['assets']} total in-scope assets ({p['wildcards']} wildcards)")
+        print(f"[{i:02d}] ★ SCORE: {p['score']}/100 | {p['surface_tier']} | [{p['platform']}] {p['name']}")
+        print(f"     🏢 Company Info : Policy: {p['url']}")
+        if p["website"]:
+            print(f"                       Website: {p['website']}")
+        print(f"     ⚡ Triage Speed  : {triage_info} | 💰 Payout: {payout_str}")
+        print(f"     🌐 Surface Scope : {p['assets']} In-Scope Assets ({p['wildcards']} Wildcards) | Harbor: {p['safe_harbor']}")
 
         if args.show_assets:
             cur = conn.cursor()
-            sample_assets = cur.execute("SELECT asset_identifier FROM assets WHERE program_id=? LIMIT 3", (p["id"],)).fetchall()
-            if sample_assets:
-                print("     🔎 Sample Targets: " + ", ".join([a[0] for a in sample_assets]))
-        print("-" * 80)
+            wildcard_samples = cur.execute("SELECT asset_identifier FROM assets WHERE program_id=? AND is_wildcard=1 LIMIT 3", (p["id"],)).fetchall()
+            other_samples = cur.execute("SELECT asset_identifier FROM assets WHERE program_id=? AND is_wildcard=0 LIMIT 3", (p["id"],)).fetchall()
+            
+            samples = [w[0] for w in wildcard_samples] + [o[0] for o in other_samples]
+            if samples:
+                print(f"     🔎 Target Sample : {', '.join(samples[:4])}")
+        print("-" * 88)
 
 def cmd_check(args):
     conn = get_db()
@@ -419,7 +460,7 @@ def cmd_check(args):
     cur = conn.cursor()
     
     matches = cur.execute("""
-        SELECT p.platform, p.name, p.url, p.offers_bounties, a.asset_identifier, a.is_wildcard
+        SELECT p.platform, p.name, p.url, p.website, p.offers_bounties, a.asset_identifier, a.is_wildcard
         FROM assets a
         JOIN programs p ON a.program_id = p.id
         WHERE a.asset_identifier = ? 
@@ -428,20 +469,23 @@ def cmd_check(args):
     """, (target, target)).fetchall()
 
     if matches:
-        print(f"✅ [AUTHORIZED IN-SCOPE] '{target}' matches {len(matches)} program(s):")
+        print(f"\n✅ [AUTHORIZED IN-SCOPE] '{target}' matches {len(matches)} program(s):")
         for m in matches:
             bbp = "Paid BBP" if m["offers_bounties"] else "VDP"
             wild = "(Wildcard Match)" if m["is_wildcard"] else "(Direct Match)"
             print(f"  • [{m['platform']}] {m['name']} ({bbp})")
-            print(f"    Asset Rule: {m['asset_identifier']} {wild}")
-            print(f"    Policy: {m['url']}")
+            print(f"    Asset Rule  : {m['asset_identifier']} {wild}")
+            print(f"    Policy URL  : {m['url']}")
+            if m["website"]:
+                print(f"    Company Web : {m['website']}")
+        print()
     else:
-        print(f"❌ [NOT IN KNOWN SCOPE] '{target}' was not found in active public program scopes.")
-        print("   CAUTION: Do not probe without explicit authorization!")
+        print(f"\n❌ [NOT IN KNOWN SCOPE] '{target}' was not found in active public program scopes.")
+        print("   CAUTION: Do not probe without explicit authorization!\n")
 
 def cmd_export(args):
-    results = evaluate_fast_cash()
-    limit = args.top or 50
+    results = evaluate_targets()
+    limit = args.top or 30
     target_ids = [p["id"] for p in results[:limit]]
 
     conn = get_db()
@@ -462,21 +506,17 @@ def main():
     parser = argparse.ArgumentParser(description="Scan4Me: Precision Bug Bounty Target Engine")
     sub = parser.add_subparsers(dest="command")
 
-    # sync
     p_sync = sub.add_parser("sync", help="Sync latest dataset from upstream feeds")
     
-    # filter / radar
-    p_radar = sub.add_parser("radar", help="List top targets filtered by your custom config criteria")
+    p_radar = sub.add_parser("radar", help="List top targets filtered by surface area, speed, and cash")
     p_radar.add_argument("--limit", type=int, default=20)
     p_radar.add_argument("--show-assets", action="store_true", default=True)
 
-    # check
     p_check = sub.add_parser("check", help="Verify if target is in authorized legal scope")
     p_check.add_argument("domain", help="Target domain, e.g. api.target.com")
 
-    # export
     p_export = sub.add_parser("export", help="Export clean target list for httpx/subfinder from filtered programs")
-    p_export.add_argument("--top", type=int, default=30, help="Number of top programs to export assets from")
+    p_export.add_argument("--top", type=int, default=30)
     p_export.add_argument("--wildcards-only", action="store_true")
     p_export.add_argument("--clean", action="store_true")
 
@@ -490,7 +530,6 @@ def main():
     elif args.command == "export":
         cmd_export(args)
     else:
-        # Default behavior: run radar!
         p_radar.print_help()
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 {
-  "description": "Scan4Me Custom Hunter Profile - Fast Triage, High Payouts & Fresh Scope",
+  "description": "Scan4Me Custom Hunter Profile - Fast Triage, Massive Attack Surface & Fast Cash",
   "filters": {
     "paid_bounties_only": true,
     "fast_triage": {
@@ -9,11 +9,15 @@
       "prefer_managed_triage": true,
       "max_time_to_bounty_awarded_hours": 720.0
     },
+    "attack_surface_and_scope": {
+      "prefer_large_attack_surface": true,
+      "min_in_scope_assets": 1,
+      "prioritize_wildcards": true,
+      "wildcard_multiplier": 2.5
+    },
     "freshness_and_competition": {
       "prefer_fresh_programs": true,
-      "low_report_saturation": true,
-      "min_in_scope_assets": 1,
-      "require_wildcards": false
+      "low_report_saturation": true
     },
     "payouts": {
       "min_max_payout_usd": 1000.0,
@@ -27,12 +31,14 @@
     "yeswehack": true
   },
   "ranking_weights": {
-    "triage_speed": 0.40,
-    "freshness_and_low_saturation": 0.35,
-    "payout_size": 0.25
+    "triage_speed": 0.35,
+    "attack_surface_size": 0.30,
+    "freshness_and_low_saturation": 0.20,
+    "payout_size": 0.15
   },
   "display": {
     "limit": 25,
+    "show_company_profile": true,
     "show_assets_sample": true
   }
 }
