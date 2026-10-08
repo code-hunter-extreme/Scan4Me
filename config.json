@@ -1,0 +1,38 @@
+{
+  "description": "Scan4Me Custom Hunter Profile - Fast Triage, High Payouts & Fresh Scope",
+  "filters": {
+    "paid_bounties_only": true,
+    "fast_triage": {
+      "enabled": true,
+      "max_first_response_hours": 48.0,
+      "min_response_efficiency_pct": 80.0,
+      "prefer_managed_triage": true,
+      "max_time_to_bounty_awarded_hours": 720.0
+    },
+    "freshness_and_competition": {
+      "prefer_fresh_programs": true,
+      "low_report_saturation": true,
+      "min_in_scope_assets": 1,
+      "require_wildcards": false
+    },
+    "payouts": {
+      "min_max_payout_usd": 1000.0,
+      "prioritize_fast_cash": true
+    }
+  },
+  "platforms": {
+    "hackerone": true,
+    "bugcrowd": true,
+    "intigriti": true,
+    "yeswehack": true
+  },
+  "ranking_weights": {
+    "triage_speed": 0.40,
+    "freshness_and_low_saturation": 0.35,
+    "payout_size": 0.25
+  },
+  "display": {
+    "limit": 25,
+    "show_assets_sample": true
+  }
+}

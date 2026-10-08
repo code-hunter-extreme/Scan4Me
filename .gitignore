@@ -1,0 +1,8 @@
+# Scan4Me Git Ignore
+*.db
+scan4me.db
+bounty_intelligence.db
+data_cache/
+__pycache__/
+*.pyc
+.DS_Store
