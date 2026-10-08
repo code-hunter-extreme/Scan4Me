@@ -33,6 +33,288 @@ IMMUNEFI_API_URL = None
 # Sherlock audit contest API (Web3 smart contract audit contests — confirmed public, paginated)
 SHERLOCK_API_URL = "https://audits.sherlock.xyz/api/contests"
 
+# ── Authenticated API endpoints ───────────────────────────────────────────────
+# Used when an api_key is configured for the platform; falls back to public feed.
+H1_API_BASE       = "https://api.hackerone.com/v1"
+BUGCROWD_API_BASE = "https://api.bugcrowd.com"
+INTIGRITI_API_BASE = "https://api.intigriti.com/core"
+YESWEHACK_API_BASE = "https://api.yeswehack.com"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Credential loader
+# Priority: environment variable > config.json api_keys > None
+# Never store real keys in config.json when using git — use env vars instead.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_credentials(config=None):
+    """Return a dict of per-platform credential dicts.
+
+    For each platform the returned dict has whatever keys that platform needs
+    (e.g. {'username': '...', 'api_token': '...'} for HackerOne).
+    A key is absent or None when not configured — callers must check before use.
+
+    Env var names follow the pattern documented in config.json api_keys._env.
+    Env vars always override config.json values so real secrets stay out of files.
+    """
+    cfg_keys = (config or {}).get("api_keys", {})
+
+    def _get(platform, field, env_var):
+        """env var > config.json > None"""
+        env_val = os.environ.get(env_var, "").strip()
+        if env_val:
+            return env_val
+        return (cfg_keys.get(platform) or {}).get(field) or None
+
+    return {
+        "hackerone": {
+            "username":  _get("hackerone", "username",  "HACKERONE_USERNAME"),
+            "api_token": _get("hackerone", "api_token", "HACKERONE_API_TOKEN"),
+        },
+        "bugcrowd": {
+            "api_token": _get("bugcrowd", "api_token", "BUGCROWD_API_TOKEN"),
+        },
+        "intigriti": {
+            "api_token": _get("intigriti", "api_token", "INTIGRITI_API_TOKEN"),
+        },
+        "yeswehack": {
+            "api_token": _get("yeswehack", "api_token", "YESWEHACK_API_TOKEN"),
+        },
+        # Slots for platforms that don't have APIs yet — ready when they do
+        "federacy":    {"api_token": _get("federacy",    "api_token", "FEDERACY_API_TOKEN")},
+        "immunefi":    {"api_token": _get("immunefi",    "api_token", "IMMUNEFI_API_TOKEN")},
+        "sherlock":    {"api_token": _get("sherlock",    "api_token", "SHERLOCK_API_TOKEN")},
+        "hackenproof": {"api_token": _get("hackenproof", "api_token", "HACKENPROOF_API_TOKEN")},
+        "bugbase":     {"api_token": _get("bugbase",     "api_token", "BUGBASE_API_TOKEN")},
+        "pd_programs": {"api_token": _get("pd_programs", "api_token", "PD_PROGRAMS_API_TOKEN")},
+    }
+
+
+def _api_request(url, *, auth_basic=None, bearer=None, token_header=None,
+                  method="GET", timeout=30):
+    """Make an authenticated HTTP request, return parsed JSON or raise.
+
+    auth_basic   : (username, password/token) tuple → HTTP Basic Authorization
+    bearer       : string → Authorization: Bearer <token>
+    token_header : string → Authorization: Token <token>
+    """
+    req = urllib.request.Request(url, method=method)
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "Scan4Me authenticated sync/1.0")
+    if auth_basic:
+        import base64
+        creds = base64.b64encode(f"{auth_basic[0]}:{auth_basic[1]}".encode()).decode()
+        req.add_header("Authorization", f"Basic {creds}")
+    elif bearer:
+        req.add_header("Authorization", f"Bearer {bearer}")
+    elif token_header:
+        req.add_header("Authorization", f"Token {token_header}")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Authenticated program fetchers
+# Each returns a list of normalized program dicts identical to the public feed
+# schema so sync_data can use them as a drop-in replacement.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fetch_h1_authenticated(username, api_token):
+    """Fetch your full HackerOne program list via the authenticated API.
+
+    Returns private + public programs you have access to.
+    Endpoint: GET /v1/hackers/programs (paginated, 100/page).
+    Auth: HTTP Basic username:api_token.
+    """
+    programs = []
+    page = 1
+    while True:
+        try:
+            data = _api_request(
+                f"{H1_API_BASE}/hackers/programs"
+                f"?page%5Bnumber%5D={page}&page%5Bsize%5D=100"
+                f"&sort=name&filter%5Bsubmission_state%5D%5B%5D=open",
+                auth_basic=(username, api_token),
+            )
+        except Exception as e:
+            if page == 1:
+                print(f"[!] HackerOne authenticated fetch failed: {e}")
+            break
+
+        items = data.get("data", [])
+        for item in items:
+            attrs = item.get("attributes", {})
+            handle = attrs.get("handle", "")
+            programs.append({
+                "handle": handle,
+                "name": attrs.get("name") or handle,
+                "url": f"https://hackerone.com/{handle}",
+                "website": attrs.get("profile", {}).get("website") or "",
+                "offers_bounties": bool(attrs.get("offers_bounties")),
+                "managed_program": bool(attrs.get("managed_program")),
+                "average_time_to_first_program_response": attrs.get("average_time_to_first_program_response"),
+                "average_time_to_bounty_awarded": attrs.get("average_time_to_bounty_awarded"),
+                "average_time_to_report_resolved": attrs.get("average_time_to_report_resolved"),
+                "response_efficiency_percentage": attrs.get("response_efficiency_percentage"),
+                "targets": {"in_scope": [
+                    {"asset_identifier": s.get("asset_identifier", ""),
+                     "asset_type": s.get("asset_type", "URL")}
+                    for s in attrs.get("structured_scopes", [])
+                    if s.get("eligible_for_submission")
+                ]}
+            })
+
+        links = data.get("links", {})
+        if not links.get("next"):
+            break
+        page += 1
+
+    print(f"[+] HackerOne authenticated: {len(programs)} programs (including private invites).")
+    return programs
+
+
+def _fetch_bugcrowd_authenticated(api_token):
+    """Fetch your Bugcrowd program list via the authenticated API.
+
+    Endpoint: GET /engagements (paginated).
+    Auth: Authorization: Token <api_token>.
+    """
+    programs = []
+    page = 1
+    while True:
+        try:
+            data = _api_request(
+                f"{BUGCROWD_API_BASE}/engagements?page={page}&sort=name",
+                token_header=api_token,
+            )
+        except Exception as e:
+            if page == 1:
+                print(f"[!] Bugcrowd authenticated fetch failed: {e}")
+            break
+
+        items = data.get("data", data if isinstance(data, list) else [])
+        if not items:
+            break
+        for item in items:
+            attrs = item.get("attributes", item)
+            name = attrs.get("name", "Unknown")
+            handle = attrs.get("code", name.lower().replace(" ", "-"))
+            url = attrs.get("url", "") or f"https://bugcrowd.com/{handle}"
+            if url.startswith("/"):
+                url = f"https://bugcrowd.com{url}"
+            max_p = float(attrs.get("max_payout", 0) or 0)
+            programs.append({
+                "name": name,
+                "url": url,
+                "max_payout": max_p,
+                "managed_by_bugcrowd": bool(attrs.get("managed_by_bugcrowd")),
+                "safe_harbor": attrs.get("safe_harbor", "Standard"),
+                "targets": {"in_scope": [
+                    {"target": s.get("target", ""), "type": s.get("type", "website")}
+                    for s in attrs.get("targets", {}).get("in_scope", [])
+                ]}
+            })
+
+        if len(items) < 25:
+            break
+        page += 1
+
+    print(f"[+] Bugcrowd authenticated: {len(programs)} programs (including private).")
+    return programs
+
+
+def _fetch_intigriti_authenticated(api_token):
+    """Fetch your Intigriti program list via the authenticated API.
+
+    Endpoint: GET /core/researcher/programs (paginated).
+    Auth: Authorization: Bearer <api_token>.
+    """
+    programs = []
+    page = 1
+    while True:
+        try:
+            data = _api_request(
+                f"{INTIGRITI_API_BASE}/researcher/programs"
+                f"?offset={(page-1)*20}&limit=20&status=open",
+                bearer=api_token,
+            )
+        except Exception as e:
+            if page == 1:
+                print(f"[!] Intigriti authenticated fetch failed: {e}")
+            break
+
+        records = data.get("records", data if isinstance(data, list) else [])
+        if not records:
+            break
+        for item in records:
+            handle = item.get("handle") or str(item.get("id", ""))
+            max_b = item.get("maxBounty") or item.get("max_bounty") or {}
+            max_val = float((max_b.get("value") or 0) if isinstance(max_b, dict) else 0)
+            curr = (max_b.get("currency", "EUR") if isinstance(max_b, dict) else "EUR")
+            programs.append({
+                "handle": handle,
+                "name": item.get("name", handle),
+                "url": item.get("url", f"https://app.intigriti.com/programs/{handle}"),
+                "max_bounty": {"value": max_val, "currency": curr},
+                "targets": {"in_scope": [
+                    {"endpoint": s.get("endpoint", ""), "type": s.get("type", "url")}
+                    for s in item.get("domains", item.get("targets", {}).get("in_scope", []))
+                ]}
+            })
+
+        total = data.get("total", data.get("maxCount", 0))
+        if page * 20 >= total or len(records) < 20:
+            break
+        page += 1
+
+    print(f"[+] Intigriti authenticated: {len(programs)} programs (including private).")
+    return programs
+
+
+def _fetch_yeswehack_authenticated(api_token):
+    """Fetch your YesWeHack program list via the authenticated API.
+
+    Endpoint: GET /programs (paginated, includes private programs).
+    Auth: Authorization: Bearer <api_token>.
+    """
+    programs = []
+    page = 1
+    while True:
+        try:
+            data = _api_request(
+                f"{YESWEHACK_API_BASE}/programs?page={page}&perPage=50",
+                bearer=api_token,
+            )
+        except Exception as e:
+            if page == 1:
+                print(f"[!] YesWeHack authenticated fetch failed: {e}")
+            break
+
+        items = data.get("items", data if isinstance(data, list) else [])
+        if not items:
+            break
+        for item in items:
+            programs.append({
+                "id": item.get("id", item.get("slug", "")),
+                "name": item.get("title", item.get("name", "")),
+                "max_bounty": item.get("maxBounty", item.get("max_bounty", 0)),
+                "managed": bool(item.get("managed")),
+                "targets": {"in_scope": [
+                    {"target": s.get("target", s.get("scope", "")),
+                     "target_type": s.get("type", "web")}
+                    for s in item.get("scope", item.get("targets", {}).get("in_scope", []))
+                ]}
+            })
+
+        pagination = data.get("pagination", {})
+        if page >= pagination.get("nb_pages", 1):
+            break
+        page += 1
+
+    print(f"[+] YesWeHack authenticated: {len(programs)} programs (including private).")
+    return programs
+
+
 DEFAULT_CONFIG = {
     "filters": {
         "paid_bounties_only": True,
@@ -521,13 +803,23 @@ def _fetch_sherlock_contests():
     return programs
 
 
-def sync_data(refresh=True, platforms_cfg=None):
+def sync_data(refresh=True, platforms_cfg=None, config=None):
     """Sync all enabled feed sources into the local SQLite database.
 
-    Core feeds (arkadiyt/bounty-targets-data):
+    When api_keys are configured (config.json or env vars) the authenticated API
+    is used instead of the public feed — gives access to private/invite programs.
+    Falls back to the public arkadiyt feed automatically when no key is present.
+
+    Core feeds (arkadiyt/bounty-targets-data, public fallback):
       HackerOne, Bugcrowd, Intigriti, YesWeHack, Federacy
 
-    Optional live feeds (fetched directly):
+    Authenticated feeds (when api_key configured):
+      HackerOne  — api.hackerone.com/v1/hackers/programs  (Basic username:token)
+      Bugcrowd   — api.bugcrowd.com/engagements           (Token header)
+      Intigriti  — api.intigriti.com/core/researcher/...  (Bearer token)
+      YesWeHack  — api.yeswehack.com/programs             (Bearer token)
+
+    Optional live feeds (fetched directly, no auth needed):
       Immunefi  — no public API yet; skipped gracefully
       Sherlock  — paginated audit contest API (web3)
 
@@ -536,6 +828,7 @@ def sync_data(refresh=True, platforms_cfg=None):
       Indexed as platform='PDPrograms'.  Skipped when unavailable.
     """
     platforms_cfg = platforms_cfg or {}
+    creds = load_credentials(config or load_config())
     CACHE_DATA_DIR.mkdir(parents=True, exist_ok=True)
     repo_dir = CACHE_DATA_DIR / "repo"
     cached_repo_data = repo_dir / "data"
@@ -579,16 +872,25 @@ def sync_data(refresh=True, platforms_cfg=None):
     print(f"[*] Ingesting and normalizing targets from {local_data_dir}...")
     now_ts = int(time.time())
 
-    # 1. HackerOne
-    h1_file = local_data_dir / "hackerone_data.json"
-    if h1_file.exists():
-        with open(h1_file) as f:
-            h1_data = json.load(f)
+    # 1. HackerOne — authenticated API when keys present, public feed fallback
+    h1_creds = creds.get("hackerone", {})
+    h1_username = h1_creds.get("username")
+    h1_token = h1_creds.get("api_token")
+    if h1_username and h1_token and platforms_cfg.get("hackerone", True):
+        print("[*] HackerOne: API key found — using authenticated feed (includes private invites).")
+        h1_data = _fetch_h1_authenticated(h1_username, h1_token)
+    else:
+        if h1_username or h1_token:
+            print("[!] HackerOne: partial credentials (need both username + api_token) — using public feed.")
+        h1_file = local_data_dir / "hackerone_data.json"
+        h1_data = json.load(open(h1_file)) if h1_file.exists() else []
+
+    if h1_data and platforms_cfg.get("hackerone", True):
         with conn:
             for p in h1_data:
                 handle = p.get("handle")
                 name = p.get("name") or handle
-                url = f"https://hackerone.com/{handle}"
+                url = p.get("url") or f"https://hackerone.com/{handle}"
                 website = p.get("website") or ""
                 offers_bounty = bool(p.get("offers_bounties"))
                 managed = bool(p.get("managed_program"))
@@ -599,7 +901,7 @@ def sync_data(refresh=True, platforms_cfg=None):
 
                 existing = cur.execute("SELECT id, first_seen_timestamp FROM programs WHERE platform=? AND handle=?", ("HackerOne", handle)).fetchone()
                 first_seen = existing[1] if existing else now_ts
-                
+
                 cur.execute("""
                     INSERT INTO programs (
                         platform, name, handle, url, website, offers_bounties, managed_triage,
@@ -617,7 +919,7 @@ def sync_data(refresh=True, platforms_cfg=None):
                         currency=excluded.currency,
                         last_updated_timestamp=excluded.last_updated_timestamp
                 """, ("HackerOne", name, handle, url, website, offers_bounty, managed, resp_time, bounty_time, resolved_time, efficiency, first_seen, now_ts))
-                
+
                 prog_id = cur.execute(
                     "SELECT id FROM programs WHERE platform=? AND handle=?",
                     ("HackerOne", handle)
@@ -628,11 +930,16 @@ def sync_data(refresh=True, platforms_cfg=None):
                 )
         print(f"[+] HackerOne indexed: {len(h1_data)} programs.")
 
-    # 2. Bugcrowd
-    bc_file = local_data_dir / "bugcrowd_data.json"
-    if bc_file.exists():
-        with open(bc_file) as f:
-            bc_data = json.load(f)
+    # 2. Bugcrowd — authenticated API when key present, public feed fallback
+    bc_token = creds.get("bugcrowd", {}).get("api_token")
+    if bc_token and platforms_cfg.get("bugcrowd", True):
+        print("[*] Bugcrowd: API key found — using authenticated feed (includes private programs).")
+        bc_data = _fetch_bugcrowd_authenticated(bc_token)
+    else:
+        bc_file = local_data_dir / "bugcrowd_data.json"
+        bc_data = json.load(open(bc_file)) if bc_file.exists() else []
+
+    if bc_data and platforms_cfg.get("bugcrowd", True):
         with conn:
             for p in bc_data:
                 name = p.get("name", "Unknown")
@@ -672,11 +979,16 @@ def sync_data(refresh=True, platforms_cfg=None):
                 )
         print(f"[+] Bugcrowd indexed: {len(bc_data)} programs.")
 
-    # 3. Intigriti
-    inti_file = local_data_dir / "intigriti_data.json"
-    if inti_file.exists():
-        with open(inti_file) as f:
-            inti_data = json.load(f)
+    # 3. Intigriti — authenticated API when key present, public feed fallback
+    inti_token = creds.get("intigriti", {}).get("api_token")
+    if inti_token and platforms_cfg.get("intigriti", True):
+        print("[*] Intigriti: API key found — using authenticated feed (includes private programs).")
+        inti_data = _fetch_intigriti_authenticated(inti_token)
+    else:
+        inti_file = local_data_dir / "intigriti_data.json"
+        inti_data = json.load(open(inti_file)) if inti_file.exists() else []
+
+    if inti_data and platforms_cfg.get("intigriti", True):
         with conn:
             for p in inti_data:
                 name = p.get("name", "Unknown")
@@ -713,11 +1025,16 @@ def sync_data(refresh=True, platforms_cfg=None):
                 )
         print(f"[+] Intigriti indexed: {len(inti_data)} programs.")
 
-    # 4. YesWeHack
-    ywh_file = local_data_dir / "yeswehack_data.json"
-    if ywh_file.exists():
-        with open(ywh_file) as f:
-            ywh_data = json.load(f)
+    # 4. YesWeHack — authenticated API when key present, public feed fallback
+    ywh_token = creds.get("yeswehack", {}).get("api_token")
+    if ywh_token and platforms_cfg.get("yeswehack", True):
+        print("[*] YesWeHack: API key found — using authenticated feed (includes private programs).")
+        ywh_data = _fetch_yeswehack_authenticated(ywh_token)
+    else:
+        ywh_file = local_data_dir / "yeswehack_data.json"
+        ywh_data = json.load(open(ywh_file)) if ywh_file.exists() else []
+
+    if ywh_data and platforms_cfg.get("yeswehack", True):
         with conn:
             for p in ywh_data:
                 name = p.get("name", "Unknown")
@@ -1432,6 +1749,8 @@ def main():
     p_radar.add_argument("--max-validation-days", type=float, help="Bugcrowd validation-time ceiling; requires public metadata")
     p_radar.add_argument("--max-rewarded-vulnerabilities", type=int, help="Bugcrowd historical reward-count ceiling (competition proxy, not open report count)")
 
+    sub.add_parser("keys", help="Show which API keys are configured (values masked)")
+
     p_check = sub.add_parser("check", help="Verify if target is in authorized legal scope")
     p_check.add_argument("domain", help="Target domain, e.g. api.target.com")
 
@@ -1474,7 +1793,54 @@ def main():
         if getattr(args, "no_federacy", False):
             plat_override["federacy"] = False
         merged_plat_cfg = {**config.get("platforms", {}), **plat_override}
-        sync_data(refresh=not args.offline, platforms_cfg=merged_plat_cfg)
+        sync_data(refresh=not args.offline, platforms_cfg=merged_plat_cfg, config=config)
+    elif args.command == "keys":
+        creds = load_credentials(config)
+        print("\n=== Scan4Me API Key Status ===\n")
+        STATUS = {
+            "hackerone":  ("username", "api_token"),
+            "bugcrowd":   ("api_token",),
+            "intigriti":  ("api_token",),
+            "yeswehack":  ("api_token",),
+            "federacy":   ("api_token",),
+            "immunefi":   ("api_token",),
+            "sherlock":   ("api_token",),
+            "hackenproof":("api_token",),
+            "bugbase":    ("api_token",),
+            "pd_programs":("api_token",),
+        }
+        API_NOTES = {
+            "hackerone":   "✅ Active API (Basic auth)",
+            "bugcrowd":    "✅ Active API (Token header)",
+            "intigriti":   "✅ Active API (Bearer token)",
+            "yeswehack":   "✅ Active API (Bearer token)",
+            "federacy":    "⏳ No API yet — slot reserved",
+            "immunefi":    "⏳ No public API yet — slot reserved",
+            "sherlock":    "🌐 Public API (no auth needed)",
+            "hackenproof": "⏳ No API detected — slot reserved",
+            "bugbase":     "⏳ No API yet — slot reserved",
+            "pd_programs": "🌐 Public GitHub repo (no auth needed)",
+        }
+        for plat, fields in STATUS.items():
+            plat_creds = creds.get(plat, {})
+            configured = all(plat_creds.get(f) for f in fields)
+            parts = []
+            for f in fields:
+                v = plat_creds.get(f)
+                if v:
+                    masked = v[:4] + "****" + v[-2:] if len(v) > 6 else "****"
+                    parts.append(f"{f}={masked}")
+                else:
+                    parts.append(f"{f}=NOT SET")
+            status_icon = "🔑" if configured else "○"
+            note = API_NOTES.get(plat, "")
+            print(f"  {status_icon} {plat:<12} {', '.join(parts)}")
+            print(f"               {note}")
+        print()
+        print("Set keys in config.json api_keys section OR as env vars:")
+        print("  HACKERONE_USERNAME, HACKERONE_API_TOKEN")
+        print("  BUGCROWD_API_TOKEN, INTIGRITI_API_TOKEN, YESWEHACK_API_TOKEN")
+        print("  (env vars take priority over config.json — never commit real keys)\n")
     elif args.command == "enrich":
         cmd_enrich(args)
     elif args.command == "radar":

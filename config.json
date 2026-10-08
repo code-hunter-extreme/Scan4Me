@@ -1,5 +1,59 @@
 {
   "description": "Scan4Me Hunter Profile — Fast Triage, New Programs/Assets, Low Competition, Fast Cash",
+  "api_keys": {
+    "_comment": "Set keys here OR export as env vars (env vars take priority, never commit real keys).",
+    "hackerone": {
+      "username": null,
+      "api_token": null,
+      "_env": "HACKERONE_USERNAME / HACKERONE_API_TOKEN",
+      "_doc": "Settings > API Token on hackerone.com. Auth is HTTP Basic username:api_token."
+    },
+    "bugcrowd": {
+      "api_token": null,
+      "_env": "BUGCROWD_API_TOKEN",
+      "_doc": "Settings > API on bugcrowd.com. Header: Authorization: Token <api_token>."
+    },
+    "intigriti": {
+      "api_token": null,
+      "_env": "INTIGRITI_API_TOKEN",
+      "_doc": "Settings > API Token on app.intigriti.com. Header: Authorization: Bearer <api_token>."
+    },
+    "yeswehack": {
+      "api_token": null,
+      "_env": "YESWEHACK_API_TOKEN",
+      "_doc": "Settings > API on yeswehack.com. Header: Authorization: Bearer <api_token>."
+    },
+    "federacy": {
+      "api_token": null,
+      "_env": "FEDERACY_API_TOKEN",
+      "_doc": "No public API currently. Slot reserved for when Federacy adds one."
+    },
+    "immunefi": {
+      "api_token": null,
+      "_env": "IMMUNEFI_API_TOKEN",
+      "_doc": "No public JSON API currently. Slot reserved for when Immunefi adds one."
+    },
+    "sherlock": {
+      "api_token": null,
+      "_env": "SHERLOCK_API_TOKEN",
+      "_doc": "Public read API needs no auth. Slot reserved for private contest access if added."
+    },
+    "hackenproof": {
+      "api_token": null,
+      "_env": "HACKENPROOF_API_TOKEN",
+      "_doc": "No active public API detected. Slot reserved for when HackenProof adds one."
+    },
+    "bugbase": {
+      "api_token": null,
+      "_env": "BUGBASE_API_TOKEN",
+      "_doc": "No public API currently. Slot reserved for when BugBase adds one."
+    },
+    "pd_programs": {
+      "api_token": null,
+      "_env": "PD_PROGRAMS_API_TOKEN",
+      "_doc": "Public GitHub repo — no auth needed. Slot reserved."
+    }
+  },
   "filters": {
     "paid_bounties_only": true,
     "fast_triage": {
