@@ -111,12 +111,13 @@ Tune your hunting criteria:
     "paid_bounties_only": true,
     "fast_triage": {
       "enabled": true,
-      "max_first_response_hours": 48.0,
-      "min_response_efficiency_pct": 80.0,
+      "max_first_response_hours": 24.0,
+      "min_response_efficiency_pct": 90.0,
       "prefer_managed_triage": true,
-      "max_time_to_bounty_awarded_hours": 720.0,
+      "max_time_to_bounty_awarded_hours": 336.0,
       "require_measured_response_time": false,
-      "max_validation_days": null
+      "max_validation_days": 14,
+      "strict_validation_days": false
     },
     "attack_surface_and_scope": {
       "prefer_large_attack_surface": true,
@@ -126,28 +127,38 @@ Tune your hunting criteria:
     },
     "freshness_and_competition": {
       "prefer_fresh_programs": true,
-      "prefer_new_companies": false,
+      "low_report_saturation": true,
+      "prefer_new_companies": true,
       "new_company_days": 90,
-      "prefer_new_assets": false,
+      "strict_new_companies": false,
+      "prefer_new_assets": true,
       "new_asset_days": 30,
-      "low_report_saturation": false,
-      "max_rewarded_vulnerabilities": null
+      "strict_new_assets": false,
+      "max_rewarded_vulnerabilities": 150
     },
     "payouts": {
       "min_max_payout_usd": 1000.0,
       "prioritize_fast_cash": true
+    },
+    "program_kind": {
+      "web2": true,
+      "web3": true
     }
   },
   "platforms": {
     "hackerone": true,
     "bugcrowd": true,
     "intigriti": true,
-    "yeswehack": true
+    "yeswehack": true,
+    "federacy": true,
+    "immunefi": true,
+    "sherlock": true,
+    "pd_programs": true
   },
   "ranking_weights": {
-    "triage_speed": 0.35,
-    "attack_surface_size": 0.30,
-    "freshness_and_low_saturation": 0.20,
+    "triage_speed": 0.40,
+    "attack_surface_size": 0.20,
+    "freshness_and_low_saturation": 0.25,
     "payout_size": 0.15
   }
 }

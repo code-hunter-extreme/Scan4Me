@@ -1,0 +1,5 @@
+[flake8]
+# 120: longest honest lines are display f-strings and nosec-justified audit
+# lines; black owns formatting at 88, this caps runaway length. W503/W504 are
+# already in flake8's default ignore set (black emits W503-style breaks).
+max-line-length = 120
