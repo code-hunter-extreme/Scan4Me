@@ -243,3 +243,24 @@ def test_sync_offline_missing_required_feed_raises(tmp_path, monkeypatch):
     (tmp_path / "cache" / "data" / "hackerone_data.json").unlink()
     with pytest.raises(FileNotFoundError):
         scan4me.sync_data(refresh=False, platforms_cfg=cfg, config={})
+
+
+# ── trio central key store ────────────────────────────────────────────────
+
+
+def test_trio_central_fills_gaps(tmp_path, monkeypatch):
+    central = tmp_path / "keys.env"
+    central.write_text("HACKERONE_API_TOKEN=from-central\n")
+    monkeypatch.setattr(scan4me, "TRIO_KEYS_FILE", str(central))
+    monkeypatch.delenv("HACKERONE_API_TOKEN", raising=False)
+    creds = scan4me.load_credentials(config={})
+    assert creds["hackerone"]["api_token"] == "from-central"
+
+
+def test_env_beats_trio_central(tmp_path, monkeypatch):
+    central = tmp_path / "keys.env"
+    central.write_text("HACKERONE_API_TOKEN=from-central\n")
+    monkeypatch.setattr(scan4me, "TRIO_KEYS_FILE", str(central))
+    monkeypatch.setenv("HACKERONE_API_TOKEN", "from-process")
+    creds = scan4me.load_credentials(config={})
+    assert creds["hackerone"]["api_token"] == "from-process"

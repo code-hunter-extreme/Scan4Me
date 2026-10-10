@@ -46,9 +46,30 @@ YESWEHACK_API_BASE = "https://api.yeswehack.com"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Credential loader
-# Priority: environment variable > config.json api_keys > None
+# Priority: environment variable > config.json api_keys > trio central > None
 # Never store real keys in config.json when using git — use env vars instead.
+# New shared keys go in the trio central store, never in this repo.
 # ─────────────────────────────────────────────────────────────────────────────
+TRIO_KEYS_FILE = os.path.join(
+    os.path.expanduser("~"), ".config", "trio", "keys.env"
+)
+
+
+def _read_trio_keys():
+    """Read the trio central key store. Missing/unreadable → {}."""
+    out = {}
+    try:
+        with open(TRIO_KEYS_FILE, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    if k and k not in out:
+                        out[k] = v.strip().strip("\"'")
+    except OSError:
+        pass
+    return out
 
 
 def load_credentials(config=None):
@@ -62,13 +83,23 @@ def load_credentials(config=None):
     Env vars always override config.json values so real secrets stay out of files.
     """
     cfg_keys = (config or {}).get("api_keys", {})
+    trio_keys = _read_trio_keys()
 
     def _get(platform, field, env_var):
-        """env var > config.json > None"""
+        """env var > config.json > trio central > None"""
         env_val = os.environ.get(env_var, "").strip()
         if env_val:
             return env_val
-        return (cfg_keys.get(platform) or {}).get(field) or None
+        cfg_val = (cfg_keys.get(platform) or {}).get(field)
+        if cfg_val:
+            import warnings
+            warnings.warn(
+                f"API key for {platform}.{field} loaded from config.json — "
+                "never commit config.json with real keys (git-tracked secret risk).",
+                stacklevel=3,
+            )
+            return cfg_val
+        return trio_keys.get(env_var) or None
 
     return {
         "hackerone": {
