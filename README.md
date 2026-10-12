@@ -6,7 +6,7 @@
 3. **💰 Fast Cash & High Payouts**: Strict filtering for paid BBP programs and verified bounty pools.
 4. **🆕 Official Program/Scope History**: Bugcrowd enrichment reads published program start dates and versioned scope history. Other feeds are not labeled with official dates until platform-specific adapters are added.
 
-It indexes programs and assets from **HackerOne**, **Bugcrowd**, **Intigriti**, and **YesWeHack**. Bugcrowd public statistics include rewarded-vulnerability totals, historical average payout, and validation time; those are useful competition/triage signals, but rewarded totals are not counts of open or resolved reports.
+It indexes programs and assets from **HackerOne**, **Bugcrowd**, **Intigriti**, **YesWeHack**, and **Federacy** (core feeds), plus **Sherlock** (live contest API) and the projectdiscovery public-bugbounty-programs scope feed (`PDPrograms`). Bugcrowd public statistics include rewarded-vulnerability totals, historical average payout, and validation time; those are useful competition/triage signals, but rewarded totals are not counts of open or resolved reports.
 
 ---
 
@@ -19,13 +19,16 @@ flowchart TD
         BC["Bugcrowd Feed\n(291 Programs)"]
         INTI["Intigriti Feed\n(144 Programs)"]
         YWH["YesWeHack Feed\n(56 Programs)"]
+        FED["Federacy Feed"]
+        SHER["Sherlock Feed\n(live API)"]
+        PD["PDPrograms Scope Feed"]
     end
 
     subgraph ENGINE["2. Normalization & Scoring Core (Scan4Me)"]
         PARSE["Scope & Company Extractor\n(Name, Website, Policy URL, Safe Harbor)"]
         SURFACE["Surface Area Calculator\n(Assets + Wildcards * Multiplier)"]
         TRIAGE["SLA Triage Analyzer\n(Response Time & Efficiency %)"]
-        SCORE["Composite Fast-Money Algorithm\n(Speed 35% • Surface 30% • Freshness 20% • Payout 15%)"]
+        SCORE["Composite Fast-Money Algorithm\n(Speed 40% • Surface 20% • Freshness 25% • Payout 15%)"]
     end
 
     subgraph CONFIG["3. User Hunter Config (config.json)"]
