@@ -1742,3 +1742,64 @@ def test_evaluate_targets_emits_velocity_fields(tmp_path, monkeypatch):
     assert fast["payout_per_hour_usd"] == 250.0  # 5% of $50k / 10h
     assert fast["velocity_estimated"] is False
     assert fast["velocity_score"] > 0
+
+
+# ── #5/#9 provenance stamp ──────────────────────────────────────────────────
+
+
+def test_feed_provenance_reports_sha_age_counts_gaps(tmp_path):
+    db_path = tmp_path / "t.db"
+    conn = _temp_db(db_path)
+    cur = conn.cursor()
+    now = int(time.time())
+    cur.execute(
+        "INSERT INTO programs (platform, name, handle, offers_bounties,"
+        " max_payout, first_seen_timestamp, program_kind)"
+        " VALUES ('HackerOne', 'H', 'h', 1, 0, ?, 'web2')",
+        (now,),
+    )
+    pid = cur.lastrowid
+    cur.execute(
+        "INSERT INTO assets (program_id, asset_identifier, asset_type,"
+        " is_wildcard, first_seen_timestamp) VALUES (?, 'h.example.com', 'url', 0, ?)",
+        (pid, now),
+    )
+    cur.execute(
+        "INSERT INTO sync_metadata(key, value) VALUES('upstream_sha', 'abc123')"
+    )
+    cur.execute(
+        "INSERT INTO sync_metadata(key, value) VALUES('last_sync_ts', ?)",
+        (str(now - 10 * 3600),),
+    )
+    cur.execute(
+        "INSERT INTO sync_metadata(key, value) VALUES('platform_status', ?)",
+        (json.dumps({"hackerone": {"status": "ok", "count": 1},
+                      "immunefi": {"status": "empty", "count": 0}}),),
+    )
+    conn.commit()
+    prov = scan4me.feed_provenance(conn)
+    conn.close()
+    assert prov["upstream_sha"] == "abc123"
+    assert prov["age_hours"] == 10.0
+    assert prov["stale"] is False
+    assert prov["row_counts"]["programs"] == 1
+    assert prov["row_counts"]["live_assets"] == 1
+    assert any("HackerOne payouts: 0/1" in g for g in prov["coverage_gaps"])
+    assert any("rules/policy text" in g for g in prov["coverage_gaps"])
+    assert any("immunefi" in g for g in prov["coverage_gaps"])
+
+
+def test_feed_provenance_marks_stale_and_unknown(tmp_path):
+    db_path = tmp_path / "t.db"
+    conn = _temp_db(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO sync_metadata(key, value) VALUES('last_sync_ts', ?)",
+        (str(int(time.time()) - 100 * 3600),),
+    )
+    conn.commit()
+    prov = scan4me.feed_provenance(conn)
+    conn.close()
+    assert prov["upstream_sha"] == "unknown"
+    assert prov["stale"] is True
+    assert prov["age_hours"] == 100.0

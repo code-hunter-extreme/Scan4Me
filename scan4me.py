@@ -1066,13 +1066,16 @@ def sync_oos_assets(cur, program_id, targets, identifier_key, type_key, now_ts, 
         )
 
 
-def _sync_program_scope(cur, prog_id, entry, identifier_key, type_key, now_ts):
+def _sync_program_scope(
+    cur, prog_id, entry, identifier_key, type_key, now_ts, stats=None
+):
     """Sync in-scope + out-of-scope targets for one feed entry.
 
     Each side syncs only when its key is present: feeds that structurally
     omit out-of-scope (e.g. authenticated fetchers) must not wipe previously
     synced OOS rows, and a malformed entry missing scope must not wipe scope.
     Absent sides are left untouched; present-but-empty sides tombstone.
+    Normalizer rejects accumulate into ``stats`` when passed.
     """
     targets = entry.get("targets") if isinstance(entry, dict) else None
     if not isinstance(targets, dict):
@@ -1085,6 +1088,7 @@ def _sync_program_scope(cur, prog_id, entry, identifier_key, type_key, now_ts):
             identifier_key,
             type_key,
             now_ts,
+            stats=stats,
         )
     if "out_of_scope" in targets:
         sync_oos_assets(
@@ -1094,6 +1098,7 @@ def _sync_program_scope(cur, prog_id, entry, identifier_key, type_key, now_ts):
             identifier_key,
             type_key,
             now_ts,
+            stats=stats,
         )
 
 
@@ -1633,6 +1638,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
     now_ts = int(time.time())
 
     platform_status = {}
+    ingest_stats = {}  # per-platform normalizer reject counts (tripwire)
 
     # 1. HackerOne — authenticated API when keys present, public feed fallback
     # NOTE: there is NO fallback from a failed authenticated fetch to the
@@ -1725,7 +1731,13 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     ("HackerOne", handle),
                 ).fetchone()[0]
                 _sync_program_scope(
-                    cur, prog_id, p, "asset_identifier", "asset_type", now_ts
+                    cur,
+                    prog_id,
+                    p,
+                    "asset_identifier",
+                    "asset_type",
+                    now_ts,
+                    stats=ingest_stats.setdefault("hackerone", {}),
                 )
         print(f"[+] HackerOne indexed: {len(h1_data)} programs.")
     platform_status["hackerone"] = _platform_status(
@@ -1803,7 +1815,15 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     "SELECT id FROM programs WHERE platform=? AND handle=?",
                     ("Bugcrowd", handle),
                 ).fetchone()[0]
-                _sync_program_scope(cur, prog_id, p, "target", "type", now_ts)
+                _sync_program_scope(
+                    cur,
+                    prog_id,
+                    p,
+                    "target",
+                    "type",
+                    now_ts,
+                    stats=ingest_stats.setdefault("bugcrowd", {}),
+                )
         print(f"[+] Bugcrowd indexed: {len(bc_data)} programs.")
     platform_status["bugcrowd"] = _platform_status(
         platforms_cfg.get("bugcrowd", True), bc_data, bc_source, bc_auth_used
@@ -1880,7 +1900,15 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     "SELECT id FROM programs WHERE platform=? AND handle=?",
                     ("Intigriti", handle),
                 ).fetchone()[0]
-                _sync_program_scope(cur, prog_id, p, "endpoint", "type", now_ts)
+                _sync_program_scope(
+                    cur,
+                    prog_id,
+                    p,
+                    "endpoint",
+                    "type",
+                    now_ts,
+                    stats=ingest_stats.setdefault("intigriti", {}),
+                )
         print(f"[+] Intigriti indexed: {len(inti_data)} programs.")
     platform_status["intigriti"] = _platform_status(
         platforms_cfg.get("intigriti", True), inti_data, inti_source, inti_auth_used
@@ -1951,7 +1979,15 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     "SELECT id FROM programs WHERE platform=? AND handle=?",
                     ("YesWeHack", handle),
                 ).fetchone()[0]
-                _sync_program_scope(cur, prog_id, p, "target", "type", now_ts)
+                _sync_program_scope(
+                    cur,
+                    prog_id,
+                    p,
+                    "target",
+                    "type",
+                    now_ts,
+                    stats=ingest_stats.setdefault("yeswehack", {}),
+                )
         print(f"[+] YesWeHack indexed: {len(ywh_data)} programs.")
     platform_status["yeswehack"] = _platform_status(
         platforms_cfg.get("yeswehack", True), ywh_data, ywh_source, ywh_auth_used
@@ -1996,7 +2032,15 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     "SELECT id FROM programs WHERE platform=? AND handle=?",
                     ("Federacy", handle),
                 ).fetchone()[0]
-                _sync_program_scope(cur, prog_id, p, "target", "type", now_ts)
+                _sync_program_scope(
+                    cur,
+                    prog_id,
+                    p,
+                    "target",
+                    "type",
+                    now_ts,
+                    stats=ingest_stats.setdefault("federacy", {}),
+                )
         print(f"[+] Federacy indexed: {len(fed_data)} programs.")
     elif not fed_file.exists():
         print("[*] Federacy feed not found in repo — skipping.")
@@ -2232,6 +2276,9 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
             pd_attempted, pd_programs_list, "pd-repo"
         )
 
+    for _plat, _st in ingest_stats.items():
+        if _plat in platform_status and _st.get("rejected"):
+            platform_status[_plat]["rejected_assets"] = _st["rejected"]
     _set_meta(cur, "upstream_sha", upstream_sha)
     _set_meta(cur, "last_sync_ts", str(now_ts))
     _set_meta(cur, "last_refresh_ok", "1" if refresh_ok else "0")
@@ -2773,6 +2820,117 @@ def evaluate_targets(config=None):
     return scored_programs
 
 
+STALE_AFTER_HOURS = 48
+
+
+def feed_provenance(conn=None):
+    """Feed provenance stamp for radar/prescan/report artifacts (#5/#9).
+
+    Returns upstream SHA + per-platform fetch status + live row counts +
+    feed age + the explicit degraded-mode coverage gaps. Every claim is
+    computed from sync_metadata and live tables — never asserted statically.
+    Unknowns are reported as unknown, not as zeros.
+    """
+    own = conn is None
+    if own:
+        conn = get_db()
+    try:
+        cur = conn.cursor()
+        try:
+            meta = {
+                r["key"]: r["value"]
+                for r in cur.execute("SELECT key, value FROM sync_metadata").fetchall()
+            }
+        except Exception:
+            meta = {}
+        try:
+            plat_status = json.loads(meta.get("platform_status", "{}") or "{}")
+        except (TypeError, ValueError):
+            plat_status = {}
+        try:
+            n_programs = cur.execute("SELECT count(*) FROM programs").fetchone()[0]
+        except Exception:
+            n_programs = None
+        try:
+            n_assets = cur.execute(
+                "SELECT count(*) FROM assets WHERE deleted_timestamp=0"
+            ).fetchone()[0]
+        except Exception:
+            try:
+                n_assets = cur.execute("SELECT count(*) FROM assets").fetchone()[0]
+            except Exception:
+                n_assets = None
+        try:
+            n_contests = cur.execute("SELECT count(*) FROM contests").fetchone()[0]
+        except Exception:
+            n_contests = None
+        try:
+            h1_total, h1_paid = cur.execute(
+                "SELECT count(*), sum(CASE WHEN max_payout > 0 THEN 1 ELSE 0 END)"
+                " FROM programs WHERE platform='HackerOne'"
+            ).fetchone()
+        except Exception:
+            h1_total, h1_paid = None, None
+        try:
+            im_programs = cur.execute(
+                "SELECT count(*) FROM programs WHERE platform='Immunefi'"
+            ).fetchone()[0]
+            im_assets = cur.execute(
+                "SELECT count(*) FROM assets a JOIN programs p ON a.program_id=p.id"
+                " WHERE p.platform='Immunefi' AND a.deleted_timestamp=0"
+            ).fetchone()[0]
+        except Exception:
+            im_programs, im_assets = None, None
+    finally:
+        if own:
+            conn.close()
+
+    now_ts = int(time.time())
+    try:
+        sync_ts = int(meta.get("last_sync_ts", 0) or 0)
+    except (TypeError, ValueError):
+        sync_ts = 0
+    age_hours = round((now_ts - sync_ts) / 3600.0, 1) if sync_ts else None
+
+    gaps = [
+        # Structural: no feed carries rules/policy text, so Oracle's verify
+        # leg 3 can only pass via downgrade-to-advisory, never via data.
+        "rules/policy text: carried by no feed — verify leg 3 has no data leg"
+    ]
+    if h1_total:
+        gaps.append(
+            f"HackerOne payouts: {h1_paid or 0}/{h1_total} programs carry a"
+            " ceiling — the rest cannot pass exact payout verification"
+        )
+    if im_programs is not None:
+        gaps.append(
+            f"Immunefi: {im_programs} programs, {im_assets or 0} scope rows"
+            " (programs-only until detail-page scope fetch lands)"
+        )
+    for plat in sorted(plat_status):
+        entry = plat_status[plat] or {}
+        status = entry.get("status", "unknown")
+        if status != "ok":
+            gaps.append(
+                f"platform {plat}: last sync status={status}"
+                f" (rows={entry.get('count', 0)})"
+            )
+    return {
+        "upstream_sha": meta.get("upstream_sha") or "unknown",
+        "last_sync_ts": sync_ts or None,
+        "age_hours": age_hours,
+        "stale": age_hours is not None and age_hours > STALE_AFTER_HOURS,
+        "refresh_ok": meta.get("last_refresh_ok") != "0",
+        "platforms": plat_status,
+        "row_counts": {
+            "programs": n_programs,
+            "live_assets": n_assets,
+            "contests": n_contests,
+        },
+        "coverage_gaps": gaps,
+    }
+
+
 def cmd_filter(args, config):
     results = evaluate_targets(config)
     limit = args.limit or config.get("display", {}).get("limit", 20)
@@ -2785,6 +2943,29 @@ def cmd_filter(args, config):
         "🔥 SCAN4ME PRECISION TARGET RADAR (FAST TRIAGE • MASSIVE ATTACK SURFACE • FAST CASH)"
     )
     print("=" * 88)
+    _prov = feed_provenance()
+    _counts = _prov["row_counts"]
+    _age = (
+        f"{_prov['age_hours']}h old"
+        if _prov["age_hours"] is not None
+        else "age unknown (never synced?)"
+    )
+    print(
+        f"[*] Provenance: upstream={str(_prov['upstream_sha'])[:12]}"
+        f" | {_age}"
+        + (" [STALE]" if _prov["stale"] else "")
+        + f" | programs={_counts['programs']} live_assets={_counts['live_assets']}"
+        f" contests={_counts['contests']}"
+    )
+    _bad = sorted(
+        p
+        for p, e in (_prov["platforms"] or {}).items()
+        if (e or {}).get("status", "unknown") != "ok"
+    )
+    if _bad:
+        print(f"[!] Degraded feeds: {', '.join(_bad)} (see coverage gaps below)")
+    for _gap in _prov["coverage_gaps"]:
+        print(f"[!] Coverage gap: {_gap}")
     if fresh_cfg.get("prefer_new_companies"):
         print(
             "[*] New program filter uses Bugcrowd's published program start date; unsupported platforms are excluded."
