@@ -9,6 +9,7 @@ Run:  python3 -m pytest tests/ -q   (from the Scan4Me directory)
 import json
 import sqlite3
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -264,3 +265,390 @@ def test_env_beats_trio_central(tmp_path, monkeypatch):
     monkeypatch.setenv("HACKERONE_API_TOKEN", "from-process")
     creds = scan4me.load_credentials(config={})
     assert creds["hackerone"]["api_token"] == "from-process"
+
+
+# ── P6: Sherlock contests separated from programs ─────────────────────────────
+
+
+def test_p6_contest_migration_drops_exactly_contest_rows(tmp_path):
+    """Baseline mirror: 1200 rows in programs including 259 Sherlock contests.
+
+    After migrate_db, programs must drop by exactly the 259 contest rows
+    (1200 -> 941) with contests preserved 1:1 in the contests table and
+    assets/wildcards untouched.
+    """
+    conn = _temp_db(tmp_path / "t.db")
+    cur = conn.cursor()
+    cur.executemany(
+        """INSERT INTO programs (platform, handle, name, offers_bounties,
+           max_payout, first_seen_timestamp)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        [
+            ("HackerOne", f"prog-{i}", f"Program {i}", 1, 0, 1000 - i)
+            for i in range(941)
+        ],
+    )
+    cur.executemany(
+        """INSERT INTO programs (platform, handle, name, offers_bounties,
+           max_payout, first_seen_timestamp)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        [
+            ("Sherlock", f"sherlock-{i}", f"Contest {i}", 1, 5000.0, 2000 + i)
+            for i in range(259)
+        ],
+    )
+    prog_id = cur.execute("SELECT id FROM programs WHERE handle='prog-0'").fetchone()[0]
+    cur.execute(
+        """INSERT INTO assets (program_id, asset_identifier, asset_type,
+           is_wildcard, first_seen_timestamp)
+           VALUES (?, '*.example.com', 'URL', 1, 100)""",
+        (prog_id,),
+    )
+    cur.execute(
+        """INSERT INTO assets (program_id, asset_identifier, asset_type,
+           is_wildcard, first_seen_timestamp)
+           VALUES (?, 'api.example.com', 'URL', 0, 100)""",
+        (prog_id,),
+    )
+    conn.commit()
+    assert cur.execute("SELECT count(*) FROM programs").fetchone()[0] == 1200
+
+    scan4me.migrate_db(conn)
+
+    assert cur.execute("SELECT count(*) FROM programs").fetchone()[0] == 941
+    assert cur.execute("SELECT count(*) FROM contests").fetchone()[0] == 259
+    assert (
+        cur.execute(
+            "SELECT count(*) FROM programs WHERE platform='Sherlock'"
+        ).fetchone()[0]
+        == 0
+    )
+    assert cur.execute("SELECT count(*) FROM assets").fetchone()[0] == 2
+    assert (
+        cur.execute("SELECT count(*) FROM assets WHERE is_wildcard=1").fetchone()[0]
+        == 1
+    )
+    row = cur.execute(
+        "SELECT name, max_payout, first_seen_timestamp FROM contests"
+        " WHERE handle='sherlock-7'"
+    ).fetchone()
+    assert tuple(row) == ("Contest 7", 5000.0, 2007)
+
+    # Idempotent: a second run changes nothing.
+    scan4me.migrate_db(conn)
+    assert cur.execute("SELECT count(*) FROM programs").fetchone()[0] == 941
+    assert cur.execute("SELECT count(*) FROM contests").fetchone()[0] == 259
+    conn.close()
+
+
+def _eval_config(**platforms):
+    base = {
+        "hackerone": False,
+        "bugcrowd": False,
+        "intigriti": False,
+        "yeswehack": False,
+        "federacy": False,
+        "immunefi": False,
+        "sherlock": False,
+        "pd_programs": False,
+    }
+    base.update(platforms)
+    return {
+        "platforms": base,
+        "filters": {
+            "paid_bounties_only": True,
+            "fast_triage": {"enabled": True},
+            "attack_surface_and_scope": {
+                "min_in_scope_assets": 1,
+                "wildcard_multiplier": 2.5,
+            },
+            "freshness_and_competition": {"prefer_new_assets": False},
+            "program_kind": {"web2": True, "web3": True},
+        },
+    }
+
+
+def test_p6_evaluate_excludes_contests(tmp_path, monkeypatch):
+    db_path = tmp_path / "t.db"
+    conn = _temp_db(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO programs (platform, name, handle, offers_bounties,
+           max_payout, first_seen_timestamp)
+           VALUES ('HackerOne', 'Real Program', 'real-program', 1, 1000, 100)"""
+    )
+    prog_id = cur.lastrowid
+    cur.execute(
+        """INSERT INTO assets (program_id, asset_identifier, asset_type,
+           is_wildcard, first_seen_timestamp)
+           VALUES (?, 'a.example.com', 'URL', 0, 100)""",
+        (prog_id,),
+    )
+    cur.execute(
+        """INSERT INTO contests (platform, name, handle, url, offers_bounties,
+           max_payout, first_seen_timestamp, last_updated_timestamp)
+           VALUES ('Sherlock', 'Contest', 'sherlock-1',
+           'https://audits.sherlock.xyz/contests/1', 1, 999999, 100, 100)"""
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(scan4me, "DB_PATH", db_path)
+
+    both = scan4me.evaluate_targets(_eval_config(hackerone=True, sherlock=True))
+    assert [p["name"] for p in both] == ["Real Program"]
+
+    sherlock_only = scan4me.evaluate_targets(_eval_config(sherlock=True))
+    assert sherlock_only == []
+
+
+# ── P6: batched new-asset queries (N+1 fix) ───────────────────────────────────
+
+
+class _CountingCursor:
+    """Proxy cursor that counts execute() calls."""
+
+    def __init__(self, cursor, counter):
+        self._cursor = cursor
+        self._counter = counter
+
+    def execute(self, sql, params=()):
+        self._counter[0] += 1
+        return self._cursor.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class _CountingConn:
+    """Proxy connection handing out counting cursors."""
+
+    def __init__(self, conn, counter):
+        self._conn = conn
+        self._counter = counter
+
+    def cursor(self):
+        return _CountingCursor(self._conn.cursor(), self._counter)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_p6_new_asset_queries_batched(tmp_path, monkeypatch):
+    """8 Bugcrowd programs with strict new-asset scoring on.
+
+    Pre-fix this issued 1 + 8 + 8 = 17 queries (per-program loop, twice).
+    Post-fix: 1 main + 1 batched new-asset + 1 batched enrichment = 3.
+    """
+    db_path = tmp_path / "t.db"
+    conn = _temp_db(db_path)
+    cur = conn.cursor()
+    now = int(time.time())
+    for i in range(8):
+        cur.execute(
+            """INSERT INTO programs (platform, name, handle, offers_bounties,
+               max_payout, first_seen_timestamp)
+               VALUES ('Bugcrowd', ?, ?, 1, 1000, ?)""",
+            (f"Program {i}", f"prog-{i}", now - 200 * 86400),
+        )
+        cur.execute(
+            """INSERT INTO assets (program_id, asset_identifier, asset_type,
+               is_wildcard, first_seen_timestamp,
+               official_first_seen_timestamp)
+               VALUES (?, ?, 'URL', 0, ?, ?)""",
+            (
+                cur.lastrowid,
+                f"new{i}.example.com",
+                now - 200 * 86400,
+                now - 2 * 86400,
+            ),
+        )
+    conn.commit()
+    conn.close()
+    real_conn = sqlite3.connect(str(db_path))
+    real_conn.row_factory = sqlite3.Row
+    counter = [0]
+
+    def _counting_db():
+        return _CountingConn(real_conn, counter)
+
+    monkeypatch.setattr(scan4me, "get_db", _counting_db)
+    cfg = _eval_config(bugcrowd=True)
+    cfg["filters"]["freshness_and_competition"] = {
+        "prefer_new_assets": True,
+        "strict_new_assets": True,
+        "new_asset_days": 30,
+    }
+    results = scan4me.evaluate_targets(cfg)
+    real_conn.close()
+
+    assert len(results) == 8
+    assert all(p["new_assets"] == 1 for p in results)
+    assert counter[0] == 3
+
+
+# ── P6: scoring composite unchanged ───────────────────────────────────────────
+
+
+def _seed_scoring_fixture(cur, now):
+    day = 86400
+    cur.execute(
+        """INSERT INTO programs (platform, name, handle, url, offers_bounties,
+           managed_triage, first_response_hours, bounty_awarded_hours,
+           response_efficiency, max_payout, currency, first_seen_timestamp,
+           last_updated_timestamp, program_kind)
+           VALUES ('HackerOne', 'Fast Corp', 'fast-corp',
+           'https://hackerone.com/fast-corp', 1, 1, 10.0, 100.0, 90.0,
+           50000, 'USD', ?, ?, 'web2')""",
+        (now - 200 * day, now),
+    )
+    h1 = cur.lastrowid
+    for i in range(20):
+        cur.execute(
+            """INSERT INTO assets (program_id, asset_identifier, asset_type,
+               is_wildcard, first_seen_timestamp)
+               VALUES (?, ?, 'URL', 0, ?)""",
+            (h1, f"host{i}.fast.example.com", now - 200 * day),
+        )
+    for i in range(5):
+        cur.execute(
+            """INSERT INTO assets (program_id, asset_identifier, asset_type,
+               is_wildcard, first_seen_timestamp)
+               VALUES (?, ?, 'URL', 1, ?)""",
+            (h1, f"*.wild{i}.fast.example.com", now - 200 * day),
+        )
+    for i in range(2):
+        cur.execute(
+            """INSERT INTO assets (program_id, asset_identifier, asset_type,
+               is_wildcard, first_seen_timestamp)
+               VALUES (?, ?, 'URL', 0, ?)""",
+            (h1, f"new{i}.fast.example.com", now - 5 * day),
+        )
+
+    cur.execute(
+        """INSERT INTO programs (platform, name, handle, url, offers_bounties,
+           max_payout, currency, first_seen_timestamp, last_updated_timestamp,
+           official_start_timestamp, rewarded_vulnerabilities, validation_days,
+           average_payout, program_kind)
+           VALUES ('Bugcrowd', 'Enriched Inc', 'enriched-inc',
+           'https://bugcrowd.com/enriched-inc', 1, 10000, 'USD', ?, ?, ?,
+           10, 5.0, 1000.0, 'web2')""",
+        (now - 200 * day, now, now - 10 * day),
+    )
+    bc = cur.lastrowid
+    for i in range(6):
+        cur.execute(
+            """INSERT INTO assets (program_id, asset_identifier, asset_type,
+               is_wildcard, first_seen_timestamp)
+               VALUES (?, ?, 'URL', 0, ?)""",
+            (bc, f"app{i}.enriched.example.com", now - 200 * day),
+        )
+    for i in range(2):
+        cur.execute(
+            """INSERT INTO assets (program_id, asset_identifier, asset_type,
+               is_wildcard, first_seen_timestamp)
+               VALUES (?, ?, 'URL', 1, ?)""",
+            (bc, f"*.w{i}.enriched.example.com", now - 200 * day),
+        )
+    cur.execute(
+        """INSERT INTO assets (program_id, asset_identifier, asset_type,
+           is_wildcard, first_seen_timestamp, official_first_seen_timestamp)
+           VALUES (?, 'fresh.enriched.example.com', 'URL', 0, ?, ?)""",
+        (bc, now - 200 * day, now - 3 * day),
+    )
+
+    cur.execute(
+        """INSERT INTO programs (platform, name, handle, url, offers_bounties,
+           max_payout, currency, first_seen_timestamp, last_updated_timestamp,
+           program_kind)
+           VALUES ('Intigriti', 'Small Shop', 'small-shop',
+           'https://intigriti.com/small-shop', 1, 0, 'USD', ?, ?, 'web2')""",
+        (now - 400 * day, now),
+    )
+    iw = cur.lastrowid
+    for i in range(2):
+        cur.execute(
+            """INSERT INTO assets (program_id, asset_identifier, asset_type,
+               is_wildcard, first_seen_timestamp)
+               VALUES (?, ?, 'URL', 0, ?)""",
+            (iw, f"srv{i}.small.example.com", now - 400 * day),
+        )
+
+
+def test_p6_scoring_composite_unchanged(tmp_path, monkeypatch):
+    """Composite scores pinned to values captured before the P6 batching edit.
+
+    Any change to the scoring math or the batched new-asset counts breaks this.
+    """
+    db_path = tmp_path / "t.db"
+    conn = _temp_db(db_path)
+    _seed_scoring_fixture(conn.cursor(), int(time.time()))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(scan4me, "DB_PATH", db_path)
+
+    cfg = _eval_config(hackerone=True, bugcrowd=True, intigriti=True)
+    cfg["filters"]["freshness_and_competition"] = {
+        "prefer_new_assets": True,
+        "new_asset_days": 30,
+        "prefer_new_companies": True,
+        "new_company_days": 90,
+    }
+    results = scan4me.evaluate_targets(cfg)
+
+    got = [
+        (
+            p["name"],
+            p["platform"],
+            p["score"],
+            p["speed_score"],
+            p["surface_score"],
+            p["fresh_score"],
+            p["payout_score"],
+            p["assets"],
+            p["wildcards"],
+            p["new_assets"],
+            p["surface_tier"],
+        )
+        for p in results
+    ]
+    assert got == [
+        (
+            "Fast Corp",
+            "HackerOne",
+            86.2,
+            100.0,
+            85.0,
+            65.0,
+            85.0,
+            27,
+            5,
+            2,
+            "⚡ WIDE SURFACE",
+        ),
+        (
+            "Enriched Inc",
+            "Bugcrowd",
+            76.8,
+            70.0,
+            70.0,
+            100.0,
+            75.0,
+            9,
+            2,
+            1,
+            "🎯 MODERATE",
+        ),
+        (
+            "Small Shop",
+            "Intigriti",
+            44.8,
+            50.0,
+            25.0,
+            50.0,
+            65.0,
+            2,
+            0,
+            0,
+            "🔍 NARROW/FOCUSED",
+        ),
+    ]

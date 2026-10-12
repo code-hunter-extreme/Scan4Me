@@ -524,7 +524,27 @@ def init_db(conn):
                 FOREIGN KEY (program_id) REFERENCES programs(id)
             );
 
+            CREATE TABLE contests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL,
+                name TEXT NOT NULL,
+                handle TEXT,
+                url TEXT,
+                offers_bounties BOOLEAN DEFAULT 0,
+                max_payout REAL DEFAULT 0,
+                currency TEXT DEFAULT 'USD',
+                status TEXT,
+                starts_at TEXT,
+                ends_at TEXT,
+                description TEXT,
+                first_seen_timestamp INTEGER DEFAULT 0,
+                last_updated_timestamp INTEGER DEFAULT 0,
+                UNIQUE(platform, handle)
+            );
+
             CREATE INDEX idx_asset_identifier ON assets(asset_identifier);
+            CREATE INDEX idx_contest_platform ON contests(platform);
+            CREATE INDEX idx_contest_first_seen ON contests(first_seen_timestamp);
             CREATE INDEX idx_program_platform ON programs(platform);
             CREATE INDEX idx_program_bounty ON programs(offers_bounties);
             CREATE INDEX idx_program_first_seen ON programs(first_seen_timestamp);
@@ -587,6 +607,58 @@ def migrate_db(conn):
         cur.execute(
             "ALTER TABLE assets ADD COLUMN official_first_seen_timestamp INTEGER"
         )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS contests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform TEXT NOT NULL,
+            name TEXT NOT NULL,
+            handle TEXT,
+            url TEXT,
+            offers_bounties BOOLEAN DEFAULT 0,
+            max_payout REAL DEFAULT 0,
+            currency TEXT DEFAULT 'USD',
+            status TEXT,
+            starts_at TEXT,
+            ends_at TEXT,
+            description TEXT,
+            first_seen_timestamp INTEGER DEFAULT 0,
+            last_updated_timestamp INTEGER DEFAULT 0,
+            UNIQUE(platform, handle)
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_contest_platform ON contests(platform)")
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_contest_first_seen "
+        "ON contests(first_seen_timestamp)"
+    )
+
+    # P6: Sherlock audit contests are not bug-bounty programs. Move any legacy
+    # contest rows out of programs into contests. Idempotent: once moved, no
+    # platform='Sherlock' rows remain in programs and this is a no-op.
+    for row in cur.execute(
+        """SELECT name, handle, url, offers_bounties, max_payout, currency,
+           first_seen_timestamp, last_updated_timestamp
+           FROM programs WHERE platform='Sherlock'"""
+    ).fetchall():
+        cur.execute(
+            """
+            INSERT INTO contests (
+                platform, name, handle, url, offers_bounties, max_payout,
+                currency, first_seen_timestamp, last_updated_timestamp
+            ) VALUES ('Sherlock', ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(platform, handle) DO UPDATE SET
+                name=excluded.name, url=excluded.url,
+                offers_bounties=excluded.offers_bounties,
+                max_payout=excluded.max_payout,
+                currency=excluded.currency,
+                last_updated_timestamp=excluded.last_updated_timestamp
+            """,
+            tuple(row),
+        )
+    cur.execute("DELETE FROM programs WHERE platform='Sherlock'")
 
     conn.commit()
 
@@ -901,6 +973,13 @@ def _fetch_sherlock_contests():
         page += 1
 
     return programs
+
+
+def _contest_ts(value):
+    """Normalize a Sherlock contest timestamp for TEXT storage (int/ISO/None)."""
+    if value is None or isinstance(value, str):
+        return value
+    return str(value)
 
 
 def sync_data(refresh=True, platforms_cfg=None, config=None):
@@ -1416,22 +1495,27 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                 for p in sherlock_contests:
                     handle = p["handle"]
                     existing = cur.execute(
-                        "SELECT id, first_seen_timestamp FROM programs WHERE platform=? AND handle=?",
+                        "SELECT id, first_seen_timestamp FROM contests WHERE platform=? AND handle=?",
                         ("Sherlock", handle),
                     ).fetchone()
                     first_seen = existing[1] if existing else now_ts
 
                     cur.execute(
                         """
-                        INSERT INTO programs (
-                            platform, name, handle, url, website, offers_bounties, managed_triage,
-                            max_payout, currency, program_kind, first_seen_timestamp, last_updated_timestamp
-                        ) VALUES (?, ?, ?, ?, '', ?, 0, ?, ?, 'web3', ?, ?)
+                        INSERT INTO contests (
+                            platform, name, handle, url, offers_bounties, max_payout,
+                            currency, status, starts_at, ends_at, description,
+                            first_seen_timestamp, last_updated_timestamp
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(platform, handle) DO UPDATE SET
                             name=excluded.name, url=excluded.url,
                             offers_bounties=excluded.offers_bounties,
                             max_payout=excluded.max_payout,
                             currency=excluded.currency,
+                            status=excluded.status,
+                            starts_at=excluded.starts_at,
+                            ends_at=excluded.ends_at,
+                            description=excluded.description,
                             last_updated_timestamp=excluded.last_updated_timestamp
                     """,
                         (
@@ -1442,6 +1526,10 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                             p["offers_bounties"],
                             p["max_payout"],
                             p["currency"],
+                            p.get("status"),
+                            _contest_ts(p.get("starts_at")),
+                            _contest_ts(p.get("ends_at")),
+                            p.get("description"),
                             first_seen,
                             now_ts,
                         ),
@@ -1551,6 +1639,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
     if is_baseline_sync:
         cur.execute("UPDATE programs SET first_seen_timestamp=0")
         cur.execute("UPDATE assets SET first_seen_timestamp=0")
+        cur.execute("UPDATE contests SET first_seen_timestamp=0")
         cur.execute(
             "INSERT INTO sync_metadata(key, value) VALUES('baseline_complete', ?) ",
             (str(now_ts),),
@@ -1566,6 +1655,11 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
     print(
         f"\n[✓] Scan4Me Sync Complete: {total_progs} programs, {total_assets} assets ({total_wild} wildcards)."
     )
+    total_contests = cur.execute("SELECT count(*) FROM contests").fetchone()[0]
+    if total_contests:
+        print(
+            f"[*] Sherlock contests tracked separately: {total_contests} (not counted as programs)."
+        )
 
 
 def cmd_enrich(args):
@@ -1648,7 +1742,8 @@ def evaluate_targets(config=None):
         "yeswehack": "YesWeHack",
         "federacy": "Federacy",
         "immunefi": "Immunefi",
-        "sherlock": "Sherlock",
+        # P6: Sherlock contests live in the contests table, not programs —
+        # enabling "sherlock" controls contest sync only, never radar rows.
         "pd_programs": "PDPrograms",
     }
     target_plats = [plat_map[p] for p in enabled_plats if p in plat_map]
@@ -1705,6 +1800,35 @@ def evaluate_targets(config=None):
     new_company_days_score = fresh_cfg.get("new_company_days", 90)
     new_asset_cutoff = now_ts - (new_asset_days * 86400)
     new_company_cutoff = now_ts - (new_company_days_score * 86400)
+
+    # P6: batch the new-asset signals (one GROUP BY each) instead of one query
+    # per program. Counts are identical to the former per-program loop.
+    new_asset_counts = {}
+    enriched_program_ids = set()
+    if fresh_cfg.get("prefer_new_assets", False) and rows:
+        batched_ids = [r["id"] for r in rows]
+        batched_holders = ",".join("?" * len(batched_ids))
+        # ?-holders only; values stay bound parameters (B608 false positive).
+        for program_id, cnt in cur.execute(
+            "SELECT program_id, count(*) FROM assets WHERE program_id IN ("  # nosec B608
+            + batched_holders
+            + ") AND ("
+            "(official_first_seen_timestamp IS NOT NULL"
+            " AND official_first_seen_timestamp > ?)"
+            " OR (official_first_seen_timestamp IS NULL"
+            " AND first_seen_timestamp > ?)"
+            ") GROUP BY program_id",
+            (*batched_ids, new_asset_cutoff, new_asset_cutoff),
+        ).fetchall():
+            new_asset_counts[program_id] = cnt
+        if fresh_cfg.get("strict_new_assets", False):
+            for (enriched_id,) in cur.execute(
+                "SELECT DISTINCT program_id FROM assets WHERE program_id IN ("  # nosec B608
+                + batched_holders
+                + ") AND official_first_seen_timestamp IS NOT NULL",
+                batched_ids,
+            ).fetchall():
+                enriched_program_ids.add(enriched_id)
 
     for r in rows:
         # ── Triage speed hard filters (HackerOne only — only platform with the data) ──
@@ -1763,25 +1887,13 @@ def evaluate_targets(config=None):
         # This is a SCORING signal — programs with no new assets still appear but score lower.
         new_assets_count = 0
         if fresh_cfg.get("prefer_new_assets", False):
-            new_assets_count = cur.execute(
-                """SELECT count(*) FROM assets WHERE program_id=?
-                   AND (
-                     (official_first_seen_timestamp IS NOT NULL AND official_first_seen_timestamp > ?)
-                     OR
-                     (official_first_seen_timestamp IS NULL AND first_seen_timestamp > ?)
-                   )""",
-                (r["id"], new_asset_cutoff, new_asset_cutoff),
-            ).fetchone()[0]
+            new_assets_count = new_asset_counts.get(r["id"], 0)
             # Only hard-exclude if strict_new_assets is set AND this is a Bugcrowd program
             # with enrichment data that actually shows no new scope. All other platforms pass.
             if (
                 fresh_cfg.get("strict_new_assets", False)
                 and r["platform"] == "Bugcrowd"
-                and cur.execute(
-                    "SELECT count(*) FROM assets WHERE program_id=? AND official_first_seen_timestamp IS NOT NULL",
-                    (r["id"],),
-                ).fetchone()[0]
-                > 0
+                and r["id"] in enriched_program_ids
                 and new_assets_count == 0
             ):
                 continue
