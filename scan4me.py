@@ -8,6 +8,7 @@ and first-observed changes in the imported feeds.
 
 import argparse
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -378,7 +379,7 @@ def _fetch_yeswehack_authenticated(api_token):
                         "in_scope": [
                             {
                                 "target": s.get("target", s.get("scope", "")),
-                                "target_type": s.get("type", "web"),
+                                "type": s.get("type", "web"),
                             }
                             for s in item.get(
                                 "scope", item.get("targets", {}).get("in_scope", [])
@@ -741,7 +742,174 @@ def _eligibility_of(target):
     )
 
 
-def sync_assets(cur, program_id, targets, identifier_key, type_key, now_ts):
+# ── Asset normalizer (#4): canonical types + identifiers at ingest ──────────────
+# Raw feeds use 15+ case/source-variant type strings and verbatim identifiers
+# (scheme-prefixed wildcards, free-text sentences, bare words like "all").
+# Everything is canonicalized here, once, before storage; match-time code
+# (scope_match, clean_asset_identifier, the Oracle bridge) applies the same
+# host-stripping so old verbatim rows still match until the next sync.
+CANON_ASSET_TYPES = frozenset(
+    {
+        "url",
+        "wildcard",
+        "cidr",
+        "api",
+        "ios_app",
+        "android_app",
+        "smart_contract",
+        "source_code",
+        "executable",
+        "other",
+    }
+)
+
+_CANON_TYPE_ALIASES = {
+    # url-ish
+    "url": "url",
+    "website": "url",
+    "web": "url",
+    "web_application": "url",
+    "webapplication": "url",
+    "web_app": "url",
+    "webapp": "url",
+    "domain": "url",
+    "subdomain": "url",
+    "host": "url",
+    # wildcard
+    "wildcard": "wildcard",
+    # ip-ish (single literals and ranges both ride as cidr: non-DNS scope)
+    "cidr": "cidr",
+    "ip": "cidr",
+    "ip_address": "cidr",
+    "ipaddress": "cidr",
+    "iprange": "cidr",
+    "ip_range": "cidr",
+    "network": "cidr",
+    # api
+    "api": "api",
+    # mobile
+    "android": "android_app",
+    "android_app": "android_app",
+    "google_play": "android_app",
+    "google_play_app_id": "android_app",
+    "googleplay_app_id": "android_app",
+    "ios": "ios_app",
+    "ios_app": "ios_app",
+    "apple": "ios_app",
+    "apple_store_app_id": "ios_app",
+    "applestore_app_id": "ios_app",
+    "mobile": "other",
+    # web3
+    "smartcontract": "smart_contract",
+    "smart_contract": "smart_contract",
+    "contract": "smart_contract",
+    "blockchain": "smart_contract",
+    # source
+    "source_code": "source_code",
+    "sourcecode": "source_code",
+    "github": "source_code",
+    "repository": "source_code",
+    "repo": "source_code",
+    "git": "source_code",
+    # binaries
+    "executable": "executable",
+    "downloadable_executables": "executable",
+    "downloadable": "executable",
+    "binary": "executable",
+    "download": "executable",
+    # fallback
+    "other": "other",
+    "unknown": "other",
+    "": "other",
+}
+
+
+def canonicalize_asset_type(raw_type):
+    """Map any raw feed type string to the canonical enum (default: other)."""
+    key = str(raw_type or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return _CANON_TYPE_ALIASES.get(key, "other")
+
+
+def _strip_host(value):
+    """Lowercased bare host from a URL-ish identifier (no scheme/path/port)."""
+    text = (value or "").strip().lower().rstrip(".")
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    text = text.split("/")[0].split("@")[-1].strip().rstrip(".")
+    if text.startswith("[") and "]" in text:  # IPv6 literal
+        return text[1:].split("]", 1)[0]
+    if text.count(":") == 1 and "*" not in text:  # host:port
+        text = text.split(":")[0]
+    return text.strip().rstrip(".")
+
+
+def canonicalize_asset(identifier, raw_type):
+    """Canonicalize one scope identifier + type.
+
+    Returns ``(identifier, asset_type, is_wildcard, ok)``. ``ok`` is False
+    for non-host junk (free-text sentences, bare words like Intigriti's
+    ``"all"`` endpoint) which callers must reject, never store as scope.
+    CIDRs, IPs and app IDs are kept verbatim (lowercased) with their enum
+    type — they are scope, just not DNS scope.
+    """
+    raw = (identifier or "").strip()
+    if not raw:
+        return "", "other", 0, False
+    atype = canonicalize_asset_type(raw_type)
+    lowered = raw.lower().rstrip(".")
+
+    # IP literals / ranges: scope, not DNS — keep verbatim, never host-strip.
+    # A "/" alone is not a CIDR (URLs have paths): require ipaddress to agree.
+    token = raw.split()[0] if raw.split() else ""
+    if " " in raw:
+        return "", "other", 0, False
+    if "/" in token or atype == "cidr":
+        try:
+            return str(ipaddress.ip_address(token)), "cidr", 0, True
+        except ValueError:
+            pass
+        try:
+            return str(ipaddress.ip_network(token, strict=False)), "cidr", 0, True
+        except ValueError:
+            pass
+        if "/" in token:
+            pass  # URL path, not a range — fall through to host stripping.
+        elif atype == "cidr":
+            return "", "other", 0, False  # feed claims CIDR, value unparseable.
+    # App IDs / package names / store numerics: keep verbatim.
+    if atype in ("ios_app", "android_app"):
+        if " " in raw:
+            return "", "other", 0, False
+        return lowered, atype, 0, True
+
+    host = _strip_host(raw)
+    if not host or " " in host:
+        return "", "other", 0, False
+    is_wildcard = 0
+    if "*" in host:
+        star, _, rest = host.partition("*")
+        # Only leading-star forms are matchable scope (*.base, *-glued).
+        if star not in ("",):
+            return "", "other", 0, False
+        rest = rest.lstrip(".")
+        if not rest or "*" in rest or " " in rest:
+            return "", "other", 0, False
+        # Glued form (*-prefix.host) keeps its literal post-star shape.
+        host = "*." + rest if not rest.startswith("-") else "*" + rest
+        is_wildcard = 1
+        atype = "wildcard"
+    else:
+        # DNS-ish scope needs a dot (rejects "all" and other bare words);
+        # localhost is the one legitimate single-label host.
+        if "." not in host and host != "localhost":
+            return "", "other", 0, False
+    if atype == "wildcard" and not is_wildcard:
+        # Feed claims wildcard but the identifier has no star: typeless host.
+        atype = "url"
+    return host, atype, is_wildcard, True
+
+
+def sync_assets(cur, program_id, targets, identifier_key, type_key, now_ts, stats=None):
     """Reconcile a program's current scope while retaining first-observed times.
 
     Vanished assets are TOMBSTONED (deleted_timestamp set), never hard-DELETEd:
@@ -749,42 +917,54 @@ def sync_assets(cur, program_id, targets, identifier_key, type_key, now_ts):
     of destroying first-seen evidence, and reappearing assets resurrect with
     their original first_seen_timestamp intact. Live-scope queries must filter
     ``deleted_timestamp=0``. Per-asset eligibility flags are stored verbatim.
+    Identifiers + types are canonicalized at ingest (#4); rejected junk is
+    counted into ``stats["rejected"]`` when a stats dict is passed.
     """
     current_assets = {}
     for target in targets:
         if not isinstance(target, dict):
             continue
-        identifier = str(target.get(identifier_key) or "").strip()
+        raw_identifier = str(target.get(identifier_key) or "").strip()
         target_name = str(target.get("name") or "").strip().lower()
         if (
-            "temporarily out of scope" in identifier.lower()
+            "temporarily out of scope" in raw_identifier.lower()
             or "temporarily out of scope" in target_name
         ):
             continue
-        if identifier:
-            current_assets[identifier] = (
-                target.get(type_key, "URL"),
-                *_eligibility_of(target),
-            )
+        identifier, asset_type, is_wildcard, ok = canonicalize_asset(
+            raw_identifier, target.get(type_key, "URL")
+        )
+        if not ok or not identifier:
+            if stats is not None:
+                stats["rejected"] = stats.get("rejected", 0) + 1
+            continue
+        current_assets[identifier] = (
+            asset_type,
+            is_wildcard,
+            *_eligibility_of(target),
+        )
 
-    existing_assets = {
-        row["asset_identifier"]: row
-        for row in cur.execute(
-            "SELECT id, asset_identifier, first_seen_timestamp, deleted_timestamp"
-            " FROM assets WHERE program_id=?",
-            (program_id,),
-        ).fetchall()
-    }
+    # Case-insensitive lookup: the canonicalizer lowercases, so verbatim
+    # legacy rows still match and keep their original first_seen evidence.
+    existing_assets = {}
+    for row in cur.execute(
+        "SELECT id, asset_identifier, first_seen_timestamp, deleted_timestamp"
+        " FROM assets WHERE program_id=?",
+        (program_id,),
+    ).fetchall():
+        existing_assets.setdefault(
+            (row["asset_identifier"] or "").strip().lower(), row
+        )
     for identifier, spec in current_assets.items():
-        asset_type, bounty, submission, instruction, severity = spec
-        is_wildcard = int("*" in identifier)
-        existing = existing_assets.get(identifier)
+        asset_type, is_wildcard, bounty, submission, instruction, severity = spec
+        existing = existing_assets.get(identifier.strip().lower())
         if existing:
             cur.execute(
-                """UPDATE assets SET asset_type=?, is_wildcard=?,
+                """UPDATE assets SET asset_identifier=?, asset_type=?, is_wildcard=?,
                    eligible_for_bounty=?, eligible_for_submission=?,
                    instruction=?, max_severity=?, deleted_timestamp=0 WHERE id=?""",
                 (
+                    identifier,
                     asset_type,
                     is_wildcard,
                     bounty,
@@ -815,10 +995,11 @@ def sync_assets(cur, program_id, targets, identifier_key, type_key, now_ts):
                 ),
             )
 
+    current_lower = {identifier.strip().lower() for identifier in current_assets}
     stale_ids = [
         row["id"]
-        for identifier, row in existing_assets.items()
-        if identifier not in current_assets and not (row["deleted_timestamp"] or 0)
+        for lowered, row in existing_assets.items()
+        if lowered not in current_lower and not (row["deleted_timestamp"] or 0)
     ]
     if stale_ids:
         cur.executemany(
@@ -827,36 +1008,41 @@ def sync_assets(cur, program_id, targets, identifier_key, type_key, now_ts):
         )
 
 
-def sync_oos_assets(cur, program_id, targets, identifier_key, type_key, now_ts):
+def sync_oos_assets(cur, program_id, targets, identifier_key, type_key, now_ts, stats=None):
     """Reconcile a program's OUT-OF-SCOPE identifiers (tombstoned, like scope).
 
     Only call when the feed entry actually carries out-of-scope data — feeds
     without the key must leave previously synced OOS rows untouched.
+    Canonicalized at ingest like scope (#4); rejects counted into stats.
     """
     current_oos = {}
     for target in targets:
         if not isinstance(target, dict):
             continue
-        identifier = str(target.get(identifier_key) or "").strip()
-        if identifier:
-            current_oos[identifier] = target.get(type_key, "URL")
+        raw_identifier = str(target.get(identifier_key) or "").strip()
+        identifier, asset_type, is_wildcard, ok = canonicalize_asset(
+            raw_identifier, target.get(type_key, "URL")
+        )
+        if not ok or not identifier:
+            if stats is not None:
+                stats["rejected"] = stats.get("rejected", 0) + 1
+            continue
+        current_oos[identifier] = (asset_type, is_wildcard)
 
-    existing_oos = {
-        row["asset_identifier"]: row
-        for row in cur.execute(
-            "SELECT id, asset_identifier, first_seen_timestamp, deleted_timestamp"
-            " FROM oos_assets WHERE program_id=?",
-            (program_id,),
-        ).fetchall()
-    }
-    for identifier, asset_type in current_oos.items():
-        is_wildcard = int("*" in identifier)
-        existing = existing_oos.get(identifier)
+    existing_oos = {}
+    for row in cur.execute(
+        "SELECT id, asset_identifier, first_seen_timestamp, deleted_timestamp"
+        " FROM oos_assets WHERE program_id=?",
+        (program_id,),
+    ).fetchall():
+        existing_oos.setdefault((row["asset_identifier"] or "").strip().lower(), row)
+    for identifier, (asset_type, is_wildcard) in current_oos.items():
+        existing = existing_oos.get(identifier.strip().lower())
         if existing:
             cur.execute(
-                """UPDATE oos_assets SET asset_type=?, is_wildcard=?,
+                """UPDATE oos_assets SET asset_identifier=?, asset_type=?, is_wildcard=?,
                    deleted_timestamp=0 WHERE id=?""",
-                (asset_type, is_wildcard, existing["id"]),
+                (identifier, asset_type, is_wildcard, existing["id"]),
             )
         else:
             cur.execute(
@@ -867,10 +1053,11 @@ def sync_oos_assets(cur, program_id, targets, identifier_key, type_key, now_ts):
                 (program_id, identifier, asset_type, is_wildcard, now_ts),
             )
 
+    current_lower = {identifier.strip().lower() for identifier in current_oos}
     stale_ids = [
         row["id"]
-        for identifier, row in existing_oos.items()
-        if identifier not in current_oos and not (row["deleted_timestamp"] or 0)
+        for lowered, row in existing_oos.items()
+        if lowered not in current_lower and not (row["deleted_timestamp"] or 0)
     ]
     if stale_ids:
         cur.executemany(
@@ -1764,7 +1951,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     "SELECT id FROM programs WHERE platform=? AND handle=?",
                     ("YesWeHack", handle),
                 ).fetchone()[0]
-                _sync_program_scope(cur, prog_id, p, "target", "target_type", now_ts)
+                _sync_program_scope(cur, prog_id, p, "target", "type", now_ts)
         print(f"[+] YesWeHack indexed: {len(ywh_data)} programs.")
     platform_status["yeswehack"] = _platform_status(
         platforms_cfg.get("yeswehack", True), ywh_data, ywh_source, ywh_auth_used
@@ -2602,25 +2789,29 @@ def cmd_filter(args, config):
 def scope_match(target, asset_identifier, is_wildcard):
     """Fail-closed scope match: True only when target is provably in scope.
 
-    Non-wildcard assets require an exact (case-insensitive) match.
-    '*.base' wildcards match proper subdomains of base only — never the apex
-    itself and never lookalike suffixes ('evilexample.com' is NOT in scope).
-    Glued wildcards ('*-prefix.host') match targets ending in the literal rest.
-    Anything else (mid-string '*', empty inputs) returns False.
+    The rule is canonicalized at match time (#4), so legacy verbatim rows
+    (scheme-prefixed wildcards like 'http://*.x') match until the next sync
+    rewrites them. Non-wildcard assets require an exact (case-insensitive)
+    host match. '*.base' wildcards match proper subdomains of base only —
+    never the apex itself and never lookalike suffixes ('evilexample.com'
+    is NOT in scope). Glued wildcards ('*-prefix.host') match targets
+    ending in the literal rest. Anything else returns False.
     """
-    t = (target or "").strip().lower().rstrip(".")
-    a = (asset_identifier or "").strip().lower().rstrip(".")
-    if not t or not a:
+    t = _strip_host(target)
+    rule, _, rule_wild, ok = canonicalize_asset(
+        asset_identifier, "wildcard" if is_wildcard else "url"
+    )
+    if not t or not ok or not rule:
         return False
-    if not is_wildcard:
-        return t == a
-    if a.startswith("*."):
-        base = a[2:]
+    if not (is_wildcard or rule_wild):
+        return t == rule
+    if rule.startswith("*."):
+        base = rule[2:]
         if not base or "*" in base:
             return False
         return t.endswith("." + base)
-    if a.startswith("*"):
-        rest = a[1:]
+    if rule.startswith("*"):
+        rest = rule[1:]
         if not rest or "*" in rest:
             return False
         return t.endswith(rest)
@@ -2628,8 +2819,12 @@ def scope_match(target, asset_identifier, is_wildcard):
 
 
 def clean_asset_identifier(value):
-    """Strip one wildcard prefix and URL cruft for recon-tool piping."""
-    val = (value or "").strip()
+    """Bare host for recon-tool piping: no scheme, path, port, or star."""
+    host, _, _, ok = canonicalize_asset(value, "url")
+    if ok and host and "*" not in host:
+        return host
+    # Wildcards / non-DNS: best-effort strip of scheme + star only.
+    val = _strip_host(value)
     if val.startswith("*."):
         val = val[2:]
     elif val.startswith("*"):

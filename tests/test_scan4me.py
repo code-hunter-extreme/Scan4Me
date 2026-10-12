@@ -85,7 +85,10 @@ def test_clean_asset_identifier():
     assert scan4me.clean_asset_identifier("*.example.com") == "example.com"
     assert scan4me.clean_asset_identifier("example.com/") == "example.com"
     assert scan4me.clean_asset_identifier("*-vpn.8x8.com") == "-vpn.8x8.com"
-    assert scan4me.clean_asset_identifier("  *.Example.COM/ ") == "Example.COM"
+    # #4: output is canonicalized (lowercased, scheme/path/port stripped).
+    assert scan4me.clean_asset_identifier("  *.Example.COM/ ") == "example.com"
+    assert scan4me.clean_asset_identifier("https://Sub.X.com:8443/a?b=1") == "sub.x.com"
+    assert scan4me.clean_asset_identifier("http://*.innov8.work") == "innov8.work"
 
 
 # ── apply_cli_overrides ───────────────────────────────────────────────────────
@@ -1408,8 +1411,9 @@ def test_p5_yeswehack_authenticated(monkeypatch):
     assert len(calls) == 1
     assert calls[0][0].startswith(f"{scan4me.YESWEHACK_API_BASE}/programs")
     assert calls[0][1]["bearer"] == "tok"
+    # Auth normalizer emits the same target/type keys as the public feed (#4).
     assert programs[0]["targets"]["in_scope"] == [
-        {"target": "ywhcorp.com", "target_type": "web"}
+        {"target": "ywhcorp.com", "type": "web"}
     ]
 
 
@@ -1439,3 +1443,114 @@ def test_p5_api_request_auth_headers(monkeypatch):
     assert seen["auth"] == "Bearer tok"
     scan4me._api_request("https://x.test", token_header="tok")
     assert seen["auth"] == "Token tok"
+
+
+# ── #4 feed normalizer ──────────────────────────────────────────────────────
+
+
+def test_normalizer_canonicalizes_types():
+    cases = {
+        "URL": "url",
+        "url": "url",
+        "website": "url",
+        "WILDCARD": "wildcard",
+        "wildcard": "wildcard",
+        "OTHER": "other",
+        "other": "other",
+        "api": "api",
+        "API": "api",
+        "android": "android_app",
+        "GOOGLE_PLAY_APP_ID": "android_app",
+        "ios": "ios_app",
+        "APPLE_STORE_APP_ID": "ios_app",
+        "IP_ADDRESS": "cidr",
+        "iprange": "cidr",
+        "CIDR": "cidr",
+        "web-application": "url",
+        "SmartContract": "smart_contract",
+        "SOURCE_CODE": "source_code",
+        "DOWNLOADABLE_EXECUTABLES": "executable",
+        "bogus-type": "other",
+        "": "other",
+        None: "other",
+    }
+    for raw, want in cases.items():
+        assert scan4me.canonicalize_asset_type(raw) == want, raw
+
+
+def test_normalizer_strips_scheme_path_port():
+    ident, atype, wild, ok = scan4me.canonicalize_asset(
+        "https://Sub.X.com:8443/a?b=1", "website"
+    )
+    assert (ident, atype, wild, ok) == ("sub.x.com", "url", 0, True)
+    ident, atype, wild, ok = scan4me.canonicalize_asset(
+        "http://*.innov8.work", "WILDCARD"
+    )
+    assert (ident, atype, wild, ok) == ("*.innov8.work", "wildcard", 1, True)
+    ident, atype, wild, ok = scan4me.canonicalize_asset("*-vpn.8x8.com", "wildcard")
+    assert (ident, atype, wild, ok) == ("*-vpn.8x8.com", "wildcard", 1, True)
+
+
+def test_normalizer_rejects_non_hosts():
+    assert scan4me.canonicalize_asset("all", "url")[3] is False
+    assert scan4me.canonicalize_asset("Any resource created by the hunter", "other")[3] is False
+    assert scan4me.canonicalize_asset("", "url")[3] is False
+    assert scan4me.canonicalize_asset("mid*dle.com", "url")[3] is False
+    assert scan4me.canonicalize_asset("not a cidr", "CIDR")[3] is False
+
+
+def test_normalizer_keeps_cidr_and_app_ids():
+    assert scan4me.canonicalize_asset("10.0.0.0/8", "iprange") == (
+        "10.0.0.0/8", "cidr", 0, True,
+    )
+    assert scan4me.canonicalize_asset("1.2.3.4", "IP_ADDRESS") == (
+        "1.2.3.4", "cidr", 0, True,
+    )
+    ident, atype, wild, ok = scan4me.canonicalize_asset(
+        "com.example.app", "GOOGLE_PLAY_APP_ID"
+    )
+    assert (ident, atype, wild, ok) == ("com.example.app", "android_app", 0, True)
+
+
+def test_scope_match_scheme_prefixed_wildcard():
+    assert scan4me.scope_match("a.innov8.work", "http://*.innov8.work", True) is True
+    assert scan4me.scope_match("innov8.work", "http://*.innov8.work", True) is False
+    assert scan4me.scope_match("x.evilinnov8.work", "http://*.innov8.work", True) is False
+    assert scan4me.scope_match("sub.x.com", "https://sub.x.com/login", 0) is True
+
+
+def test_sync_assets_normalizes_and_counts_rejects(tmp_path):
+    conn = _temp_db(tmp_path / "t.db")
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO programs (platform, name, handle) VALUES (?, ?, ?)",
+        ("YesWeHack", "YWH", "ywh"),
+    )
+    program_id = cur.lastrowid
+    conn.commit()
+    stats = {}
+    scan4me.sync_assets(
+        cur,
+        program_id,
+        [
+            {"target": "https://cockpit.outscale.com/", "type": "web-application"},
+            {"target": "Any resource created by the hunter", "type": "other"},
+            {"target": "all", "type": "url"},
+            {"target": "10.1.0.0/16", "type": "iprange"},
+        ],
+        "target",
+        "type",
+        1000,
+        stats=stats,
+    )
+    conn.commit()
+    rows = cur.execute(
+        "SELECT asset_identifier, asset_type FROM assets WHERE program_id=?",
+        (program_id,),
+    ).fetchall()
+    got = sorted((r["asset_identifier"], r["asset_type"]) for r in rows)
+    assert got == [
+        ("10.1.0.0/16", "cidr"),
+        ("cockpit.outscale.com", "url"),
+    ]
+    assert stats["rejected"] == 2
