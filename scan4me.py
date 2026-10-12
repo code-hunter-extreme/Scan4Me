@@ -2321,6 +2321,52 @@ def cmd_enrich(args):
             time.sleep(args.delay)
 
 
+def score_payout_velocity(prog):
+    """Expected payout-per-triage-hour rank for a scored program dict.
+
+    Returns ``(payout_per_hour_usd_or_None, velocity_score_0_100, estimated)``.
+
+    Method (documented heuristic, not calibrated economics):
+      expected payout = average_payout when published, else 5% of the max
+      ceiling as a severity-discounted proxy (most reports pay far under max);
+      triage hours = first_response_hours when known, else validation_days*24.
+      payout/hour = expected / triage_hours; the 0-100 score is
+      20*log10(pph+1) so $10/h ≈ 21, $100/h ≈ 40, $1000/h ≈ 60.
+    When payout or triage time is unknown there is no honest $/h number:
+    pph is None and the score falls back to (payout+speed)/4, flagged
+    estimated=True so callers can sort measured ranks above guesses.
+    """
+    import math
+
+    avg_p = prog.get("average_payout") or 0
+    max_p = prog.get("max_payout") or 0
+    if avg_p > 0:
+        expected = float(avg_p)
+    elif max_p > 0:
+        expected = float(max_p) * 0.05
+    else:
+        expected = 0.0
+    triage_hours = None
+    if prog.get("first_resp") is not None:
+        try:
+            triage_hours = float(prog["first_resp"])
+        except (TypeError, ValueError):
+            triage_hours = None
+    if triage_hours is None and prog.get("validation_days") is not None:
+        try:
+            triage_hours = float(prog["validation_days"]) * 24.0
+        except (TypeError, ValueError):
+            triage_hours = None
+    if expected > 0 and triage_hours is not None and triage_hours > 0:
+        pph = expected / triage_hours
+        score = round(min(100.0, max(0.0, 20.0 * math.log10(pph + 1.0))), 1)
+        return round(pph, 2), score, False
+    fallback = round(
+        ((prog.get("payout_score") or 0) + (prog.get("speed_score") or 0)) / 4.0, 1
+    )
+    return None, fallback, True
+
+
 def evaluate_targets(config=None):
     config = config or load_config()
     conn = get_db()
@@ -2333,6 +2379,7 @@ def evaluate_targets(config=None):
     fast_triage = filters.get("fast_triage", {})
     surface_cfg = filters.get("attack_surface_and_scope", {})
     fresh_cfg = filters.get("freshness_and_competition", {})
+    payout_cfg = filters.get("payouts", {})
     plat_cfg = config.get("platforms", {})
     weights = config.get(
         "ranking_weights",
@@ -2409,6 +2456,16 @@ def evaluate_targets(config=None):
     max_first_resp = fast_triage.get("max_first_response_hours", 48.0)
     min_efficiency = fast_triage.get("min_response_efficiency_pct", 80.0)
     wildcard_mult = surface_cfg.get("wildcard_multiplier", 2.5)
+    if not surface_cfg.get("prioritize_wildcards", True):
+        wildcard_mult = 1.0
+    min_max_payout = payout_cfg.get("min_max_payout_usd")
+    fast_cash = payout_cfg.get("prioritize_fast_cash", True)
+    prefer_large_surface = surface_cfg.get("prefer_large_attack_surface", True)
+    prefer_fresh = fresh_cfg.get("prefer_fresh_programs", True)
+    low_saturation = fresh_cfg.get("low_report_saturation", True)
+    prefer_managed = fast_triage.get("prefer_managed_triage", False)
+    award_tier2 = fast_triage.get("max_time_to_bounty_awarded_hours", 336.0) or 336.0
+    award_tier1 = award_tier2 / 2.0
     new_asset_days = fresh_cfg.get("new_asset_days", 30)
     new_company_days_score = fresh_cfg.get("new_company_days", 90)
     new_asset_cutoff = now_ts - (new_asset_days * 86400)
@@ -2478,6 +2535,21 @@ def evaluate_targets(config=None):
             ):
                 continue
             # Bugcrowd programs without enrichment data pass through (data unknown ≠ slow)
+        # strict_validation_days: Bugcrowd programs WITHOUT the data are out.
+        if (
+            fast_triage.get("strict_validation_days", False)
+            and r["platform"] == "Bugcrowd"
+            and r["validation_days"] is None
+        ):
+            continue
+
+        # min_max_payout_usd: drop programs whose KNOWN ceiling is below the
+        # floor. Unknown ceilings (max_payout NULL/0, e.g. all of HackerOne)
+        # pass through — unknown ≠ cheap.
+        if min_max_payout is not None:
+            _ceiling = r["max_payout"] or 0
+            if _ceiling > 0 and _ceiling < min_max_payout:
+                continue
 
         # max_rewarded_vulnerabilities: only hard-gate Bugcrowd programs with the data.
         # Non-Bugcrowd platforms always pass through (incomparable metric).
@@ -2514,38 +2586,50 @@ def evaluate_targets(config=None):
 
         # 1. Triage Speed Score (0-100)
         # HackerOne: first_response_hours drives the base (lower = faster = higher score).
-        # Bonus: bounty_awarded_hours <= 168h (1 week) = +15 pts; <= 336h (2 weeks) = +8 pts.
+        # Bonus tiers come from max_time_to_bounty_awarded_hours (default 336h:
+        # <=168h = +15 pts; <=336h = +8 pts); gated by prioritize_fast_cash.
         # Bugcrowd: validation_days <= 7 = +20 pts; <= 14 = +10 pts (fast-cash proxy).
+        # Managed triage earns +5 when prefer_managed_triage is set.
         # Other platforms default to 50 (no published measurement).
         speed_score = 50.0
         if r["platform"] == "HackerOne":
             if r["first_response_hours"] is not None:
                 speed_score = max(0, 100 - (r["first_response_hours"] * 1.5))
-            if r["bounty_awarded_hours"] is not None:
-                if r["bounty_awarded_hours"] <= 168:
+            if fast_cash and r["bounty_awarded_hours"] is not None:
+                if r["bounty_awarded_hours"] <= award_tier1:
                     speed_score = min(100.0, speed_score + 15)
-                elif r["bounty_awarded_hours"] <= 336:
+                elif r["bounty_awarded_hours"] <= award_tier2:
                     speed_score = min(100.0, speed_score + 8)
-        elif r["platform"] == "Bugcrowd" and r["validation_days"] is not None:
+        elif (
+            fast_cash
+            and r["platform"] == "Bugcrowd"
+            and r["validation_days"] is not None
+        ):
             if r["validation_days"] <= 7:
                 speed_score = min(100.0, speed_score + 20)
             elif r["validation_days"] <= 14:
                 speed_score = min(100.0, speed_score + 10)
+        if prefer_managed and r["managed_triage"]:
+            speed_score = min(100.0, speed_score + 5)
         speed_score = min(100.0, speed_score)
 
         # 2. Attack Surface Score (0-100) - "More Assets is Better, More Surface Area"
         # Each asset gives 1.5 pts, each wildcard gives (1.5 * wildcard_mult) ~ 3.75 pts
-        effective_surface = asset_count + (wild_count * wildcard_mult)
-        if effective_surface >= 40:
-            surface_score = 100.0
-        elif effective_surface >= 20:
-            surface_score = 85.0
-        elif effective_surface >= 10:
-            surface_score = 70.0
-        elif effective_surface >= 5:
+        # prefer_large_attack_surface=False flattens every program to neutral 50.
+        if not prefer_large_surface:
             surface_score = 50.0
         else:
-            surface_score = 25.0
+            effective_surface = asset_count + (wild_count * wildcard_mult)
+            if effective_surface >= 40:
+                surface_score = 100.0
+            elif effective_surface >= 20:
+                surface_score = 85.0
+            elif effective_surface >= 10:
+                surface_score = 70.0
+            elif effective_surface >= 5:
+                surface_score = 50.0
+            else:
+                surface_score = 25.0
 
         # Tier labeling
         if wild_count >= 10 or asset_count >= 30:
@@ -2579,26 +2663,29 @@ def evaluate_targets(config=None):
             else:
                 fresh_score = 50.0
 
-        # Bonus: program has recently-added in-scope assets (new attack surface)
-        if new_assets_count > 0:
-            fresh_score = min(100.0, fresh_score + 15)
+        # Freshness bonuses apply only when prefer_fresh_programs is set;
+        # the low-competition proxy is additionally gated by low_report_saturation.
+        if prefer_fresh:
+            # Bonus: program has recently-added in-scope assets (new attack surface)
+            if new_assets_count > 0:
+                fresh_score = min(100.0, fresh_score + 15)
 
-        # Bonus: prefer_new_companies signal — any platform where we can see it's new
-        if (
-            fresh_cfg.get("prefer_new_companies", False)
-            and effective_start_ts > new_company_cutoff
-        ):
-            fresh_score = min(100.0, fresh_score + 10)
+            # Bonus: prefer_new_companies signal — any platform where we can see it's new
+            if (
+                fresh_cfg.get("prefer_new_companies", False)
+                and effective_start_ts > new_company_cutoff
+            ):
+                fresh_score = min(100.0, fresh_score + 10)
 
-        # Bonus: low competition (Bugcrowd rewarded_vulnerabilities as proxy)
-        rewarded = r["rewarded_vulnerabilities"]
-        if rewarded is not None:
-            if rewarded <= 25:
-                fresh_score = min(100.0, fresh_score + 20)
-            elif rewarded <= 75:
-                fresh_score = min(100.0, fresh_score + 12)
-            elif rewarded <= 150:
-                fresh_score = min(100.0, fresh_score + 5)
+            # Bonus: low competition (Bugcrowd rewarded_vulnerabilities as proxy)
+            rewarded = r["rewarded_vulnerabilities"]
+            if low_saturation and rewarded is not None:
+                if rewarded <= 25:
+                    fresh_score = min(100.0, fresh_score + 20)
+                elif rewarded <= 75:
+                    fresh_score = min(100.0, fresh_score + 12)
+                elif rewarded <= 150:
+                    fresh_score = min(100.0, fresh_score + 5)
 
         # 4. Payout Score (0-100)
         # Base from max_payout band. Bugcrowd average_payout adds a real-money bonus
@@ -2617,10 +2704,11 @@ def evaluate_targets(config=None):
         elif r["offers_bounties"]:
             payout_score = 65.0
         avg_p = r["average_payout"] or 0
-        if avg_p >= 2000:
-            payout_score = min(100.0, payout_score + 10)
-        elif avg_p >= 500:
-            payout_score = min(100.0, payout_score + 5)
+        if fast_cash:
+            if avg_p >= 2000:
+                payout_score = min(100.0, payout_score + 10)
+            elif avg_p >= 500:
+                payout_score = min(100.0, payout_score + 5)
 
         # Composite Fast-Money & Surface Area Score
         total_score = (
@@ -2628,6 +2716,17 @@ def evaluate_targets(config=None):
             + (surface_score * weights["attack_surface_size"])
             + (fresh_score * weights["freshness_and_low_saturation"])
             + (payout_score * weights["payout_size"])
+        )
+
+        _pph, _velocity, _vest = score_payout_velocity(
+            {
+                "average_payout": r["average_payout"],
+                "max_payout": r["max_payout"],
+                "first_resp": r["first_response_hours"],
+                "validation_days": r["validation_days"],
+                "payout_score": payout_score,
+                "speed_score": speed_score,
+            }
         )
 
         scored_programs.append(
@@ -2643,6 +2742,9 @@ def evaluate_targets(config=None):
                 "fresh_score": round(fresh_score, 1),
                 "payout_score": round(payout_score, 1),
                 "surface_tier": surface_tier,
+                "payout_per_hour_usd": _pph,
+                "velocity_score": _velocity,
+                "velocity_estimated": _vest,
                 "max_payout": r["max_payout"],
                 "currency": r["currency"],
                 "first_resp": r["first_response_hours"],
@@ -2693,7 +2795,8 @@ def cmd_filter(args, config):
         )
     if fresh_cfg.get("low_report_saturation"):
         print(
-            "[!] Report counts are not included in these feeds; low/no resolved reports cannot be verified."
+            "[*] Low-saturation bonus uses Bugcrowd rewarded counts only; other"
+            " platforms carry no resolved-report signal."
         )
     print(
         f"[*] Displaying Top {min(limit, len(results))} Target Companies (Ranked by Surface & Speed):\n"

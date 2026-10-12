@@ -1554,3 +1554,191 @@ def test_sync_assets_normalizes_and_counts_rejects(tmp_path):
         ("cockpit.outscale.com", "url"),
     ]
     assert stats["rejected"] == 2
+
+
+# ── #10 dead flags wired + velocity scorer ───────────────────────────────────
+
+
+def _scored_names(cfg, db_path, monkeypatch):
+    monkeypatch.setattr(scan4me, "DB_PATH", db_path)
+    return scan4me.evaluate_targets(cfg)
+
+
+def _flag_db(tmp_path):
+    db_path = tmp_path / "t.db"
+    conn = _temp_db(db_path)
+    _seed_scoring_fixture(conn.cursor(), int(time.time()))
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def test_min_max_payout_usd_filters_known_ceilings(tmp_path, monkeypatch):
+    db_path = _flag_db(tmp_path)
+    cfg = _eval_config(hackerone=True, bugcrowd=True)
+    cfg["filters"]["payouts"] = {"min_max_payout_usd": 20000.0}
+    names = [p["name"] for p in _scored_names(cfg, db_path, monkeypatch)]
+    # Fast Corp ($50k) stays; Enriched Inc ($10k) drops.
+    assert "Fast Corp" in names
+    assert "Enriched Inc" not in names
+
+
+def test_min_max_payout_usd_ignores_unknown_ceilings(tmp_path, monkeypatch):
+    db_path = tmp_path / "t.db"
+    conn = _temp_db(db_path)
+    cur = conn.cursor()
+    now = int(time.time())
+    cur.execute(
+        "INSERT INTO programs (platform, name, handle, offers_bounties,"
+        " max_payout, first_seen_timestamp, program_kind)"
+        " VALUES ('HackerOne', 'Unknown Pay', 'unknown-pay', 1, 0, ?, 'web2')",
+        (now,),
+    )
+    pid = cur.lastrowid
+    cur.execute(
+        "INSERT INTO assets (program_id, asset_identifier, asset_type,"
+        " is_wildcard, first_seen_timestamp) VALUES (?, 'u.example.com', 'url', 0, ?)",
+        (pid, now),
+    )
+    conn.commit()
+    conn.close()
+    cfg = _eval_config(hackerone=True)
+    cfg["filters"]["payouts"] = {"min_max_payout_usd": 1000000.0}
+    names = [p["name"] for p in _scored_names(cfg, db_path, monkeypatch)]
+    assert names == ["Unknown Pay"]
+
+
+def test_prefer_managed_triage_bonus(tmp_path, monkeypatch):
+    db_path = _flag_db(tmp_path)
+    base = _eval_config(hackerone=True)
+    # Suppress the +15 bounty bonus (would cap at 100 and hide the +5).
+    base["filters"]["payouts"] = {"prioritize_fast_cash": False}
+    plain = {p["name"]: p["speed_score"] for p in _scored_names(base, db_path, monkeypatch)}
+    cfg = _eval_config(hackerone=True)
+    cfg["filters"]["payouts"] = {"prioritize_fast_cash": False}
+    cfg["filters"]["fast_triage"]["prefer_managed_triage"] = True
+    bonus = {p["name"]: p["speed_score"] for p in _scored_names(cfg, db_path, monkeypatch)}
+    # Fast Corp is managed → +5; others unchanged.
+    assert bonus["Fast Corp"] == plain["Fast Corp"] + 5
+
+
+def test_bounty_award_tiers_follow_config(tmp_path, monkeypatch):
+    db_path = _flag_db(tmp_path)
+    cfg = _eval_config(hackerone=True)
+    cfg["filters"]["fast_triage"]["max_time_to_bounty_awarded_hours"] = 100.0
+    got = {p["name"]: p["speed_score"] for p in _scored_names(cfg, db_path, monkeypatch)}
+    # Fast Corp bounty_awarded_hours=100: old tiers (168/336) gave +15;
+    # configured tiers (50/100) give +8 (100 <= 100, tier 2).
+    assert got["Fast Corp"] == 100 - 10.0 * 1.5 + 8
+
+
+def test_prioritize_fast_cash_gates_bonuses(tmp_path, monkeypatch):
+    db_path = _flag_db(tmp_path)
+    cfg = _eval_config(hackerone=True, bugcrowd=True)
+    cfg["filters"]["payouts"] = {"prioritize_fast_cash": False}
+    got = {p["name"]: p for p in _scored_names(cfg, db_path, monkeypatch)}
+    assert got["Fast Corp"]["speed_score"] == 100 - 10.0 * 1.5  # no +15
+    assert got["Enriched Inc"]["speed_score"] == 50.0  # no validation bonus
+    assert got["Enriched Inc"]["payout_score"] == 70.0  # no avg-payout +5
+
+
+def test_prioritize_wildcards_and_surface_flags(tmp_path, monkeypatch):
+    db_path = _flag_db(tmp_path)
+    cfg = _eval_config(hackerone=True)
+    cfg["filters"]["attack_surface_and_scope"]["prioritize_wildcards"] = False
+    got = {p["name"]: p["surface_score"] for p in _scored_names(cfg, db_path, monkeypatch)}
+    # Fast Corp: 22 assets + 5 wildcards × 1.0 = 27 → 85.0 band.
+    assert got["Fast Corp"] == 85.0
+    cfg["filters"]["attack_surface_and_scope"]["prefer_large_attack_surface"] = False
+    got = {p["name"]: p["surface_score"] for p in _scored_names(cfg, db_path, monkeypatch)}
+    assert got["Fast Corp"] == 50.0
+
+
+def test_freshness_flags_gate_bonuses(tmp_path, monkeypatch):
+    db_path = _flag_db(tmp_path)
+    cfg = _eval_config(bugcrowd=True)
+    cfg["filters"]["freshness_and_competition"] = {
+        "prefer_new_assets": True,
+        "new_asset_days": 30,
+        "prefer_new_companies": True,
+        "new_company_days": 90,
+        "prefer_fresh_programs": False,
+    }
+    got = {p["name"]: p["fresh_score"] for p in _scored_names(cfg, db_path, monkeypatch)}
+    # Enriched Inc started 10d ago → base 100, no +20 rewarded bonus.
+    assert got["Enriched Inc"] == 100.0
+    cfg["filters"]["freshness_and_competition"]["prefer_fresh_programs"] = True
+    cfg["filters"]["freshness_and_competition"]["low_report_saturation"] = False
+    got = {p["name"]: p["fresh_score"] for p in _scored_names(cfg, db_path, monkeypatch)}
+    assert got["Enriched Inc"] == 100.0  # capped; rewarded +20 suppressed
+    # Saturation gate visible on an old program: seed one without newness.
+    conn = sqlite3.connect(str(db_path))
+    cur = conn.cursor()
+    now = int(time.time())
+    cur.execute(
+        "INSERT INTO programs (platform, name, handle, offers_bounties,"
+        " max_payout, first_seen_timestamp, rewarded_vulnerabilities, program_kind)"
+        " VALUES ('Bugcrowd', 'Old Corp', 'old-corp', 1, 5000, ?, 10, 'web2')",
+        (now - 200 * 86400,),
+    )
+    pid = cur.lastrowid
+    cur.execute(
+        "INSERT INTO assets (program_id, asset_identifier, asset_type,"
+        " is_wildcard, first_seen_timestamp) VALUES (?, 'o.example.com', 'url', 0, ?)",
+        (pid, now - 200 * 86400),
+    )
+    conn.commit()
+    conn.close()
+    sat_cfg = _eval_config(bugcrowd=True)
+    sat_cfg["filters"]["freshness_and_competition"] = {"low_report_saturation": True}
+    on = {p["name"]: p["fresh_score"] for p in _scored_names(sat_cfg, db_path, monkeypatch)}
+    sat_cfg["filters"]["freshness_and_competition"]["low_report_saturation"] = False
+    off = {p["name"]: p["fresh_score"] for p in _scored_names(sat_cfg, db_path, monkeypatch)}
+    assert on["Old Corp"] - off["Old Corp"] == 20
+
+
+def test_strict_validation_days_excludes_undated(tmp_path, monkeypatch):
+    db_path = _flag_db(tmp_path)
+    cfg = _eval_config(bugcrowd=True)
+    cfg["filters"]["fast_triage"]["strict_validation_days"] = True
+    names = [p["name"] for p in _scored_names(cfg, db_path, monkeypatch)]
+    # Enriched Inc has validation_days=5 → stays; undated Bugcrowd rows drop.
+    assert "Enriched Inc" in names
+
+
+def test_velocity_scorer_measured_and_estimated():
+    pph, score, est = scan4me.score_payout_velocity(
+        {
+            "average_payout": 1000.0,
+            "max_payout": 10000,
+            "first_resp": 10.0,
+            "validation_days": None,
+            "payout_score": 70.0,
+            "speed_score": 85.0,
+        }
+    )
+    assert pph == 100.0
+    assert est is False
+    assert score == round(min(100.0, 20.0 * __import__("math").log10(101.0)), 1)
+    pph, score, est = scan4me.score_payout_velocity(
+        {
+            "average_payout": 0,
+            "max_payout": 0,
+            "first_resp": None,
+            "validation_days": None,
+            "payout_score": 65.0,
+            "speed_score": 50.0,
+        }
+    )
+    assert pph is None
+    assert est is True
+    assert score == round((65.0 + 50.0) / 4.0, 1)
+
+
+def test_evaluate_targets_emits_velocity_fields(tmp_path, monkeypatch):
+    db_path = _flag_db(tmp_path)
+    got = {p["name"]: p for p in _scored_names(_eval_config(hackerone=True), db_path, monkeypatch)}
+    fast = got["Fast Corp"]
+    assert fast["payout_per_hour_usd"] == 250.0  # 5% of $50k / 10h
+    assert fast["velocity_estimated"] is False
+    assert fast["velocity_score"] > 0
