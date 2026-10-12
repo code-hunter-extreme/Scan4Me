@@ -73,8 +73,10 @@ Expected console lines (each > 0 programs when the key is valid):
 ```
 
 A bad/revoked key soft-fails to `[!] <Platform> authenticated fetch failed: ...`
-and the platform falls back to its public feed (H1) or an empty list — sync
-still completes. That fallback is covered by
+and the platform yields an empty list — sync still completes. There is NO
+fallback from a failed authenticated fetch to the public feed: old rows linger
+untouched and the platform is recorded as `auth_empty` in `sync_metadata`
+(`platform_status`). That soft-fail is covered by
 `test_p5_h1_authenticated_failure_soft_fails`.
 
 ## 3. UNVERIFIED (needs the live runs above)

@@ -520,7 +520,23 @@ def init_db(conn):
                 asset_identifier TEXT NOT NULL,
                 asset_type TEXT,
                 is_wildcard BOOLEAN DEFAULT 0,
+                eligible_for_bounty INTEGER DEFAULT 1,
+                eligible_for_submission INTEGER DEFAULT 1,
+                instruction TEXT DEFAULT '',
+                max_severity TEXT DEFAULT '',
                 first_seen_timestamp INTEGER DEFAULT 0,
+                deleted_timestamp INTEGER DEFAULT 0,
+                FOREIGN KEY (program_id) REFERENCES programs(id)
+            );
+
+            CREATE TABLE oos_assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                program_id INTEGER,
+                asset_identifier TEXT NOT NULL,
+                asset_type TEXT,
+                is_wildcard BOOLEAN DEFAULT 0,
+                first_seen_timestamp INTEGER DEFAULT 0,
+                deleted_timestamp INTEGER DEFAULT 0,
                 FOREIGN KEY (program_id) REFERENCES programs(id)
             );
 
@@ -543,6 +559,8 @@ def init_db(conn):
             );
 
             CREATE INDEX idx_asset_identifier ON assets(asset_identifier);
+            CREATE INDEX idx_asset_program_live ON assets(program_id, deleted_timestamp);
+            CREATE INDEX idx_oos_program_live ON oos_assets(program_id, deleted_timestamp);
             CREATE INDEX idx_contest_platform ON contests(platform);
             CREATE INDEX idx_contest_first_seen ON contests(first_seen_timestamp);
             CREATE INDEX idx_program_platform ON programs(platform);
@@ -607,6 +625,38 @@ def migrate_db(conn):
         cur.execute(
             "ALTER TABLE assets ADD COLUMN official_first_seen_timestamp INTEGER"
         )
+    for column, definition in (
+        ("eligible_for_bounty", "INTEGER DEFAULT 1"),
+        ("eligible_for_submission", "INTEGER DEFAULT 1"),
+        ("instruction", "TEXT DEFAULT ''"),
+        ("max_severity", "TEXT DEFAULT ''"),
+        ("deleted_timestamp", "INTEGER DEFAULT 0"),
+    ):
+        if column not in asset_cols:
+            cur.execute(f"ALTER TABLE assets ADD COLUMN {column} {definition}")
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS oos_assets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            program_id INTEGER,
+            asset_identifier TEXT NOT NULL,
+            asset_type TEXT,
+            is_wildcard BOOLEAN DEFAULT 0,
+            first_seen_timestamp INTEGER DEFAULT 0,
+            deleted_timestamp INTEGER DEFAULT 0,
+            FOREIGN KEY (program_id) REFERENCES programs(id)
+        )
+        """
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_asset_program_live "
+        "ON assets(program_id, deleted_timestamp)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_oos_program_live "
+        "ON oos_assets(program_id, deleted_timestamp)"
+    )
 
     cur.execute(
         """
@@ -663,10 +713,47 @@ def migrate_db(conn):
     conn.commit()
 
 
+def ensure_schema(conn):
+    """Idempotent: create + migrate schema so read paths see new columns.
+
+    Write paths (sync) already init+migrate; read paths (radar/check/export)
+    call this so tombstone/eligibility filters never hit a stale schema.
+    """
+    init_db(conn)
+    migrate_db(conn)
+
+
+def _eligibility_of(target):
+    """(bounty, submission, instruction, severity) for an asset dict.
+
+    Feeds without eligibility keys (Bugcrowd/Intigriti/YWH/...) default to
+    eligible — unknown means "no signal", never "forbidden".
+    """
+    bounty = target.get("eligible_for_bounty", True)
+    submission = target.get("eligible_for_submission", True)
+    instruction = target.get("instruction") or ""
+    severity = target.get("max_severity") or ""
+    return (
+        0 if bounty is False or bounty == 0 else 1,
+        0 if submission is False or submission == 0 else 1,
+        str(instruction),
+        str(severity),
+    )
+
+
 def sync_assets(cur, program_id, targets, identifier_key, type_key, now_ts):
-    """Reconcile a program's current scope while retaining first-observed times."""
+    """Reconcile a program's current scope while retaining first-observed times.
+
+    Vanished assets are TOMBSTONED (deleted_timestamp set), never hard-DELETEd:
+    a truncated feed or upstream schema change degrades to stale scope instead
+    of destroying first-seen evidence, and reappearing assets resurrect with
+    their original first_seen_timestamp intact. Live-scope queries must filter
+    ``deleted_timestamp=0``. Per-asset eligibility flags are stored verbatim.
+    """
     current_assets = {}
     for target in targets:
+        if not isinstance(target, dict):
+            continue
         identifier = str(target.get(identifier_key) or "").strip()
         target_name = str(target.get("name") or "").strip().lower()
         if (
@@ -675,39 +762,151 @@ def sync_assets(cur, program_id, targets, identifier_key, type_key, now_ts):
         ):
             continue
         if identifier:
-            current_assets[identifier] = target.get(type_key, "URL")
+            current_assets[identifier] = (
+                target.get(type_key, "URL"),
+                *_eligibility_of(target),
+            )
 
     existing_assets = {
         row["asset_identifier"]: row
         for row in cur.execute(
-            "SELECT id, asset_identifier, first_seen_timestamp FROM assets WHERE program_id=?",
+            "SELECT id, asset_identifier, first_seen_timestamp, deleted_timestamp"
+            " FROM assets WHERE program_id=?",
             (program_id,),
         ).fetchall()
     }
-    for identifier, asset_type in current_assets.items():
+    for identifier, spec in current_assets.items():
+        asset_type, bounty, submission, instruction, severity = spec
         is_wildcard = int("*" in identifier)
         existing = existing_assets.get(identifier)
         if existing:
             cur.execute(
-                "UPDATE assets SET asset_type=?, is_wildcard=? WHERE id=?",
-                (asset_type, is_wildcard, existing["id"]),
+                """UPDATE assets SET asset_type=?, is_wildcard=?,
+                   eligible_for_bounty=?, eligible_for_submission=?,
+                   instruction=?, max_severity=?, deleted_timestamp=0 WHERE id=?""",
+                (
+                    asset_type,
+                    is_wildcard,
+                    bounty,
+                    submission,
+                    instruction,
+                    severity,
+                    existing["id"],
+                ),
             )
         else:
             cur.execute(
                 """INSERT INTO assets
-                   (program_id, asset_identifier, asset_type, is_wildcard, first_seen_timestamp)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (program_id, identifier, asset_type, is_wildcard, now_ts),
+                   (program_id, asset_identifier, asset_type, is_wildcard,
+                    eligible_for_bounty, eligible_for_submission,
+                    instruction, max_severity,
+                    first_seen_timestamp, deleted_timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+                (
+                    program_id,
+                    identifier,
+                    asset_type,
+                    is_wildcard,
+                    bounty,
+                    submission,
+                    instruction,
+                    severity,
+                    now_ts,
+                ),
             )
 
     stale_ids = [
         row["id"]
         for identifier, row in existing_assets.items()
-        if identifier not in current_assets
+        if identifier not in current_assets and not (row["deleted_timestamp"] or 0)
     ]
     if stale_ids:
         cur.executemany(
-            "DELETE FROM assets WHERE id=?", ((asset_id,) for asset_id in stale_ids)
+            "UPDATE assets SET deleted_timestamp=? WHERE id=?",
+            ((now_ts, asset_id) for asset_id in stale_ids),
+        )
+
+
+def sync_oos_assets(cur, program_id, targets, identifier_key, type_key, now_ts):
+    """Reconcile a program's OUT-OF-SCOPE identifiers (tombstoned, like scope).
+
+    Only call when the feed entry actually carries out-of-scope data — feeds
+    without the key must leave previously synced OOS rows untouched.
+    """
+    current_oos = {}
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        identifier = str(target.get(identifier_key) or "").strip()
+        if identifier:
+            current_oos[identifier] = target.get(type_key, "URL")
+
+    existing_oos = {
+        row["asset_identifier"]: row
+        for row in cur.execute(
+            "SELECT id, asset_identifier, first_seen_timestamp, deleted_timestamp"
+            " FROM oos_assets WHERE program_id=?",
+            (program_id,),
+        ).fetchall()
+    }
+    for identifier, asset_type in current_oos.items():
+        is_wildcard = int("*" in identifier)
+        existing = existing_oos.get(identifier)
+        if existing:
+            cur.execute(
+                """UPDATE oos_assets SET asset_type=?, is_wildcard=?,
+                   deleted_timestamp=0 WHERE id=?""",
+                (asset_type, is_wildcard, existing["id"]),
+            )
+        else:
+            cur.execute(
+                """INSERT INTO oos_assets
+                   (program_id, asset_identifier, asset_type, is_wildcard,
+                    first_seen_timestamp, deleted_timestamp)
+                   VALUES (?, ?, ?, ?, ?, 0)""",
+                (program_id, identifier, asset_type, is_wildcard, now_ts),
+            )
+
+    stale_ids = [
+        row["id"]
+        for identifier, row in existing_oos.items()
+        if identifier not in current_oos and not (row["deleted_timestamp"] or 0)
+    ]
+    if stale_ids:
+        cur.executemany(
+            "UPDATE oos_assets SET deleted_timestamp=? WHERE id=?",
+            ((now_ts, asset_id) for asset_id in stale_ids),
+        )
+
+
+def _sync_program_scope(cur, prog_id, entry, identifier_key, type_key, now_ts):
+    """Sync in-scope + out-of-scope targets for one feed entry.
+
+    Each side syncs only when its key is present: feeds that structurally
+    omit out-of-scope (e.g. authenticated fetchers) must not wipe previously
+    synced OOS rows, and a malformed entry missing scope must not wipe scope.
+    Absent sides are left untouched; present-but-empty sides tombstone.
+    """
+    targets = entry.get("targets") if isinstance(entry, dict) else None
+    if not isinstance(targets, dict):
+        return
+    if "in_scope" in targets:
+        sync_assets(
+            cur,
+            prog_id,
+            targets.get("in_scope") or [],
+            identifier_key,
+            type_key,
+            now_ts,
+        )
+    if "out_of_scope" in targets:
+        sync_oos_assets(
+            cur,
+            prog_id,
+            targets.get("out_of_scope") or [],
+            identifier_key,
+            type_key,
+            now_ts,
         )
 
 
@@ -786,7 +985,9 @@ def enrich_bugcrowd_program(conn, program_id, handle, now_ts=None):
 
     cur = conn.cursor()
     asset_rows = cur.execute(
-        "SELECT id, asset_identifier FROM assets WHERE program_id=?", (program_id,)
+        "SELECT id, asset_identifier FROM assets"
+        " WHERE program_id=? AND deleted_timestamp=0",
+        (program_id,)
     ).fetchall()
     first_added = {}
     for version_timestamp, aliases in sorted(scope_history):
@@ -1091,6 +1292,62 @@ def _load_pd_programs(repo_dir):
     return []
 
 
+def _upstream_sha(git_bin, repo_dir):
+    """Short upstream commit hash, or an explicit unknown marker (never fake)."""
+    if not git_bin or not (repo_dir / ".git").exists():
+        return "unknown (no upstream checkout)"
+    try:
+        proc = subprocess.run(
+            [git_bin, "-C", str(repo_dir), "rev-parse", "--short", "HEAD"],
+            check=True,
+            shell=False,  # nosec B603
+            capture_output=True,
+            text=True,
+        )
+        sha = (proc.stdout or "").strip()
+        return sha or "unknown (rev-parse empty)"
+    except (subprocess.CalledProcessError, OSError) as e:
+        return f"unknown (rev-parse failed: {e})"
+
+
+def _set_meta(cur, key, value):
+    cur.execute(
+        "INSERT INTO sync_metadata(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+
+
+def _row_last_updated(existing, now_ts, refresh_ok):
+    """last_updated for an upsert: new rows stamp now; on a failed refresh
+    existing rows keep their stamp (no freshness bump on stale data)."""
+    if existing is None:
+        return now_ts
+    if refresh_ok:
+        return now_ts
+    try:
+        return existing[2] if existing[2] is not None else now_ts
+    except (IndexError, TypeError):
+        return now_ts
+
+
+def _platform_status(enabled, data, source, auth_used=False):
+    """sync_metadata status entry for one platform feed (a staleness tripwire)."""
+    if not enabled:
+        return {"status": "skipped", "count": 0, "source": None}
+    if not data:
+        if auth_used:
+            return {
+                "status": "auth_empty",
+                "count": 0,
+                "source": source,
+                "note": "authenticated fetch returned no rows;"
+                " old rows left untouched",
+            }
+        return {"status": "empty", "count": 0, "source": source}
+    return {"status": "ok", "count": len(data), "source": source}
+
+
 def sync_data(refresh=True, platforms_cfg=None, config=None):
     """Sync all enabled feed sources into the local SQLite database.
 
@@ -1125,6 +1382,8 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
     )
 
     git_bin = shutil.which("git")
+    refresh_ok = True
+    refresh_error = ""
     if refresh:
         if not git_bin:
             raise FileNotFoundError("`git` not found on PATH; cannot refresh feeds.")
@@ -1136,7 +1395,13 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     shell=False,  # nosec B603
                 )
             except subprocess.CalledProcessError as e:
+                refresh_ok = False
+                refresh_error = str(e)
                 print(f"[!] Feed repo pull failed ({e}) — using cached snapshot.")
+                print(
+                    "[!] Stale snapshot: existing rows keep their"
+                    " last_updated_timestamp (no freshness bump)."
+                )
         else:
             subprocess.run(
                 [git_bin, "clone", "--depth", "1", UPSTREAM_REPO, str(repo_dir)],
@@ -1148,6 +1413,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
         raise FileNotFoundError(
             f"Offline feed cache not found at {local_data_dir}; run `sync` once with network access."
         )
+    upstream_sha = _upstream_sha(git_bin, repo_dir)
 
     # Core feeds are required only when their platform is enabled.
     feed_for_platform = (
@@ -1168,8 +1434,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
         )
 
     conn = get_db()
-    init_db(conn)
-    migrate_db(conn)
+    ensure_schema(conn)
 
     cur = conn.cursor()
     baseline_complete = cur.execute(
@@ -1180,15 +1445,24 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
     print(f"[*] Ingesting and normalizing targets from {local_data_dir}...")
     now_ts = int(time.time())
 
+    platform_status = {}
+
     # 1. HackerOne — authenticated API when keys present, public feed fallback
+    # NOTE: there is NO fallback from a failed authenticated fetch to the
+    # public feed — an auth failure yields an empty list and old rows linger
+    # untouched (recorded as auth_empty in sync_metadata below).
     h1_creds = creds.get("hackerone", {})
     h1_username = h1_creds.get("username")
     h1_token = h1_creds.get("api_token")
-    if h1_username and h1_token and platforms_cfg.get("hackerone", True):
+    h1_auth_used = bool(
+        h1_username and h1_token and platforms_cfg.get("hackerone", True)
+    )
+    if h1_auth_used:
         print(
             "[*] HackerOne: API key found — using authenticated feed (includes private invites)."
         )
         h1_data = _fetch_h1_authenticated(h1_username, h1_token)
+        h1_source = "authenticated"
     else:
         if h1_username or h1_token:
             print(
@@ -1200,6 +1474,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                 h1_data = json.load(f)
         else:
             h1_data = []
+        h1_source = "public-file"
 
     if h1_data and platforms_cfg.get("hackerone", True):
         with conn:
@@ -1216,10 +1491,12 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                 efficiency = p.get("response_efficiency_percentage")
 
                 existing = cur.execute(
-                    "SELECT id, first_seen_timestamp FROM programs WHERE platform=? AND handle=?",
+                    "SELECT id, first_seen_timestamp, last_updated_timestamp"
+                    " FROM programs WHERE platform=? AND handle=?",
                     ("HackerOne", handle),
                 ).fetchone()
                 first_seen = existing[1] if existing else now_ts
+                last_upd = _row_last_updated(existing, now_ts, refresh_ok)
 
                 cur.execute(
                     """
@@ -1252,7 +1529,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                         resolved_time,
                         efficiency,
                         first_seen,
-                        now_ts,
+                        last_upd,
                     ),
                 )
 
@@ -1260,23 +1537,23 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     "SELECT id FROM programs WHERE platform=? AND handle=?",
                     ("HackerOne", handle),
                 ).fetchone()[0]
-                sync_assets(
-                    cur,
-                    prog_id,
-                    p.get("targets", {}).get("in_scope", []),
-                    "asset_identifier",
-                    "asset_type",
-                    now_ts,
+                _sync_program_scope(
+                    cur, prog_id, p, "asset_identifier", "asset_type", now_ts
                 )
         print(f"[+] HackerOne indexed: {len(h1_data)} programs.")
+    platform_status["hackerone"] = _platform_status(
+        platforms_cfg.get("hackerone", True), h1_data, h1_source, h1_auth_used
+    )
 
     # 2. Bugcrowd — authenticated API when key present, public feed fallback
     bc_token = creds.get("bugcrowd", {}).get("api_token")
-    if bc_token and platforms_cfg.get("bugcrowd", True):
+    bc_auth_used = bool(bc_token and platforms_cfg.get("bugcrowd", True))
+    if bc_auth_used:
         print(
             "[*] Bugcrowd: API key found — using authenticated feed (includes private programs)."
         )
         bc_data = _fetch_bugcrowd_authenticated(bc_token)
+        bc_source = "authenticated"
     else:
         bc_file = local_data_dir / "bugcrowd_data.json"
         if bc_file.exists():
@@ -1284,6 +1561,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                 bc_data = json.load(f)
         else:
             bc_data = []
+        bc_source = "public-file"
 
     if bc_data and platforms_cfg.get("bugcrowd", True):
         with conn:
@@ -1299,10 +1577,12 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                 safe = p.get("safe_harbor", "Standard")
 
                 existing = cur.execute(
-                    "SELECT id, first_seen_timestamp FROM programs WHERE platform=? AND handle=?",
+                    "SELECT id, first_seen_timestamp, last_updated_timestamp"
+                    " FROM programs WHERE platform=? AND handle=?",
                     ("Bugcrowd", handle),
                 ).fetchone()
                 first_seen = existing[1] if existing else now_ts
+                last_upd = _row_last_updated(existing, now_ts, refresh_ok)
 
                 cur.execute(
                     """
@@ -1328,7 +1608,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                         max_p,
                         safe,
                         first_seen,
-                        now_ts,
+                        last_upd,
                     ),
                 )
 
@@ -1336,23 +1616,21 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     "SELECT id FROM programs WHERE platform=? AND handle=?",
                     ("Bugcrowd", handle),
                 ).fetchone()[0]
-                sync_assets(
-                    cur,
-                    prog_id,
-                    p.get("targets", {}).get("in_scope", []),
-                    "target",
-                    "type",
-                    now_ts,
-                )
+                _sync_program_scope(cur, prog_id, p, "target", "type", now_ts)
         print(f"[+] Bugcrowd indexed: {len(bc_data)} programs.")
+    platform_status["bugcrowd"] = _platform_status(
+        platforms_cfg.get("bugcrowd", True), bc_data, bc_source, bc_auth_used
+    )
 
     # 3. Intigriti — authenticated API when key present, public feed fallback
     inti_token = creds.get("intigriti", {}).get("api_token")
-    if inti_token and platforms_cfg.get("intigriti", True):
+    inti_auth_used = bool(inti_token and platforms_cfg.get("intigriti", True))
+    if inti_auth_used:
         print(
             "[*] Intigriti: API key found — using authenticated feed (includes private programs)."
         )
         inti_data = _fetch_intigriti_authenticated(inti_token)
+        inti_source = "authenticated"
     else:
         inti_file = local_data_dir / "intigriti_data.json"
         if inti_file.exists():
@@ -1360,6 +1638,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                 inti_data = json.load(f)
         else:
             inti_data = []
+        inti_source = "public-file"
 
     if inti_data and platforms_cfg.get("intigriti", True):
         with conn:
@@ -1377,10 +1656,12 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                 offers_bounty = max_val > 0
 
                 existing = cur.execute(
-                    "SELECT id, first_seen_timestamp FROM programs WHERE platform=? AND handle=?",
+                    "SELECT id, first_seen_timestamp, last_updated_timestamp"
+                    " FROM programs WHERE platform=? AND handle=?",
                     ("Intigriti", handle),
                 ).fetchone()
                 first_seen = existing[1] if existing else now_ts
+                last_upd = _row_last_updated(existing, now_ts, refresh_ok)
 
                 cur.execute(
                     """
@@ -1404,7 +1685,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                         max_val,
                         curr,
                         first_seen,
-                        now_ts,
+                        last_upd,
                     ),
                 )
 
@@ -1412,23 +1693,21 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     "SELECT id FROM programs WHERE platform=? AND handle=?",
                     ("Intigriti", handle),
                 ).fetchone()[0]
-                sync_assets(
-                    cur,
-                    prog_id,
-                    p.get("targets", {}).get("in_scope", []),
-                    "endpoint",
-                    "type",
-                    now_ts,
-                )
+                _sync_program_scope(cur, prog_id, p, "endpoint", "type", now_ts)
         print(f"[+] Intigriti indexed: {len(inti_data)} programs.")
+    platform_status["intigriti"] = _platform_status(
+        platforms_cfg.get("intigriti", True), inti_data, inti_source, inti_auth_used
+    )
 
     # 4. YesWeHack — authenticated API when key present, public feed fallback
     ywh_token = creds.get("yeswehack", {}).get("api_token")
-    if ywh_token and platforms_cfg.get("yeswehack", True):
+    ywh_auth_used = bool(ywh_token and platforms_cfg.get("yeswehack", True))
+    if ywh_auth_used:
         print(
             "[*] YesWeHack: API key found — using authenticated feed (includes private programs)."
         )
         ywh_data = _fetch_yeswehack_authenticated(ywh_token)
+        ywh_source = "authenticated"
     else:
         ywh_file = local_data_dir / "yeswehack_data.json"
         if ywh_file.exists():
@@ -1436,6 +1715,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                 ywh_data = json.load(f)
         else:
             ywh_data = []
+        ywh_source = "public-file"
 
     if ywh_data and platforms_cfg.get("yeswehack", True):
         with conn:
@@ -1447,10 +1727,12 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                 managed = bool(p.get("managed"))
 
                 existing = cur.execute(
-                    "SELECT id, first_seen_timestamp FROM programs WHERE platform=? AND handle=?",
+                    "SELECT id, first_seen_timestamp, last_updated_timestamp"
+                    " FROM programs WHERE platform=? AND handle=?",
                     ("YesWeHack", handle),
                 ).fetchone()
                 first_seen = existing[1] if existing else now_ts
+                last_upd = _row_last_updated(existing, now_ts, refresh_ok)
 
                 cur.execute(
                     """
@@ -1474,7 +1756,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                         managed,
                         max_val,
                         first_seen,
-                        now_ts,
+                        last_upd,
                     ),
                 )
 
@@ -1482,18 +1764,15 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     "SELECT id FROM programs WHERE platform=? AND handle=?",
                     ("YesWeHack", handle),
                 ).fetchone()[0]
-                sync_assets(
-                    cur,
-                    prog_id,
-                    p.get("targets", {}).get("in_scope", []),
-                    "target",
-                    "target_type",
-                    now_ts,
-                )
+                _sync_program_scope(cur, prog_id, p, "target", "target_type", now_ts)
         print(f"[+] YesWeHack indexed: {len(ywh_data)} programs.")
+    platform_status["yeswehack"] = _platform_status(
+        platforms_cfg.get("yeswehack", True), ywh_data, ywh_source, ywh_auth_used
+    )
 
     # 5. Federacy (optional — present in arkadiyt repo but tiny; skip when absent)
     fed_file = local_data_dir / "federacy_data.json"
+    fed_data = []
     if fed_file.exists() and platforms_cfg.get("federacy", True):
         with open(fed_file, encoding="utf-8") as f:
             fed_data = json.load(f)
@@ -1505,10 +1784,12 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                 offers_bounty = bool(p.get("offers_awards", False))
 
                 existing = cur.execute(
-                    "SELECT id, first_seen_timestamp FROM programs WHERE platform=? AND handle=?",
+                    "SELECT id, first_seen_timestamp, last_updated_timestamp"
+                    " FROM programs WHERE platform=? AND handle=?",
                     ("Federacy", handle),
                 ).fetchone()
                 first_seen = existing[1] if existing else now_ts
+                last_upd = _row_last_updated(existing, now_ts, refresh_ok)
 
                 cur.execute(
                     """
@@ -1521,27 +1802,27 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                         offers_bounties=excluded.offers_bounties,
                         last_updated_timestamp=excluded.last_updated_timestamp
                 """,
-                    ("Federacy", name, handle, url, offers_bounty, first_seen, now_ts),
+                    ("Federacy", name, handle, url, offers_bounty, first_seen, last_upd),
                 )
 
                 prog_id = cur.execute(
                     "SELECT id FROM programs WHERE platform=? AND handle=?",
                     ("Federacy", handle),
                 ).fetchone()[0]
-                sync_assets(
-                    cur,
-                    prog_id,
-                    p.get("targets", {}).get("in_scope", []),
-                    "target",
-                    "type",
-                    now_ts,
-                )
+                _sync_program_scope(cur, prog_id, p, "target", "type", now_ts)
         print(f"[+] Federacy indexed: {len(fed_data)} programs.")
     elif not fed_file.exists():
         print("[*] Federacy feed not found in repo — skipping.")
+    platform_status["federacy"] = _platform_status(
+        platforms_cfg.get("federacy", True) and fed_file.exists(),
+        fed_data,
+        "public-file",
+    )
 
     # 6. Immunefi (live fetch — Web3/DeFi; optional, skip on network failure)
-    if refresh and platforms_cfg.get("immunefi", True):
+    immunefi_programs = []
+    immunefi_attempted = bool(refresh and platforms_cfg.get("immunefi", True))
+    if immunefi_attempted:
         print("[*] Fetching Immunefi programs (Web3/DeFi live feed)...")
         immunefi_programs = _fetch_immunefi_programs()
         if immunefi_programs:
@@ -1592,9 +1873,14 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
             print(
                 "[*] Immunefi: no data returned (network unavailable or feed format changed)."
             )
+    platform_status["immunefi"] = _platform_status(
+        immunefi_attempted, immunefi_programs, "live-board"
+    )
 
     # 7. Sherlock audit contests (live fetch — Web3 smart-contract; optional, soft-fail)
-    if refresh and platforms_cfg.get("sherlock", True):
+    sherlock_contests = []
+    sherlock_attempted = bool(refresh and platforms_cfg.get("sherlock", True))
+    if sherlock_attempted:
         print(
             "[*] Fetching Sherlock audit contests (Web3 smart-contract competitions)..."
         )
@@ -1647,9 +1933,15 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
             print(f"[+] Sherlock indexed: {len(sherlock_contests)} contests.")
         else:
             print("[*] Sherlock: no contest data returned.")
+    platform_status["sherlock"] = _platform_status(
+        sherlock_attempted, sherlock_contests, "live-api"
+    )
 
     # 8. ProjectDiscovery public-bugbounty-programs (supplemental; soft-fail)
-    if refresh and platforms_cfg.get("pd_programs", True):
+    pd_programs_list = []
+    pd_attempted = bool(refresh and platforms_cfg.get("pd_programs", True))
+    pd_clone_failed = ""
+    if pd_attempted:
         pd_repo_dir = CACHE_DATA_DIR / "pd_programs_repo"
         try:
             if (pd_repo_dir / ".git").exists():
@@ -1675,6 +1967,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                 )
         except subprocess.CalledProcessError as e:
             print(f"[!] ProjectDiscovery repo sync failed — skipping: {e}")
+            pd_clone_failed = str(e)
             pd_repo_dir = None
 
         if pd_repo_dir and pd_repo_dir.exists():
@@ -1740,6 +2033,24 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     "[*] ProjectDiscovery: no programs loaded"
                     " (dist/data.json + src/data.yaml missing or unparseable)."
                 )
+    if pd_clone_failed:
+        platform_status["pd_programs"] = {
+            "status": "clone_failed",
+            "count": 0,
+            "source": "pd-repo",
+            "note": pd_clone_failed,
+        }
+    else:
+        platform_status["pd_programs"] = _platform_status(
+            pd_attempted, pd_programs_list, "pd-repo"
+        )
+
+    _set_meta(cur, "upstream_sha", upstream_sha)
+    _set_meta(cur, "last_sync_ts", str(now_ts))
+    _set_meta(cur, "last_refresh_ok", "1" if refresh_ok else "0")
+    if refresh_error:
+        _set_meta(cur, "last_refresh_error", refresh_error)
+    _set_meta(cur, "platform_status", json.dumps(platform_status, sort_keys=True))
 
     if is_baseline_sync:
         cur.execute("UPDATE programs SET first_seen_timestamp=0")
@@ -1753,12 +2064,18 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
     conn.commit()
 
     total_progs = cur.execute("SELECT count(*) FROM programs").fetchone()[0]
-    total_assets = cur.execute("SELECT count(*) FROM assets").fetchone()[0]
+    total_assets = cur.execute(
+        "SELECT count(*) FROM assets WHERE deleted_timestamp=0"
+    ).fetchone()[0]
     total_wild = cur.execute(
-        "SELECT count(*) FROM assets WHERE is_wildcard=1"
+        "SELECT count(*) FROM assets WHERE is_wildcard=1 AND deleted_timestamp=0"
+    ).fetchone()[0]
+    total_tombstoned = cur.execute(
+        "SELECT count(*) FROM assets WHERE deleted_timestamp!=0"
     ).fetchone()[0]
     print(
-        f"\n[✓] Scan4Me Sync Complete: {total_progs} programs, {total_assets} assets ({total_wild} wildcards)."
+        f"\n[✓] Scan4Me Sync Complete: {total_progs} programs, {total_assets} assets"
+        f" ({total_wild} wildcards, {total_tombstoned} tombstoned)."
     )
     total_contests = cur.execute("SELECT count(*) FROM contests").fetchone()[0]
     if total_contests:
@@ -1769,6 +2086,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
 
 def cmd_enrich(args):
     conn = get_db()
+    ensure_schema(conn)
     cur = conn.cursor()
     if args.handle:
         programs = cur.execute(
@@ -1819,6 +2137,9 @@ def cmd_enrich(args):
 def evaluate_targets(config=None):
     config = config or load_config()
     conn = get_db()
+    # No ensure_schema here: this library function is query-count-tested and
+    # already hard-references migrated columns (official_first_seen_timestamp).
+    # Callers on a stale DB must sync (which migrates) first.
     cur = conn.cursor()
 
     filters = config.get("filters", {})
@@ -1917,7 +2238,7 @@ def evaluate_targets(config=None):
         for program_id, cnt in cur.execute(
             "SELECT program_id, count(*) FROM assets WHERE program_id IN ("  # nosec B608
             + batched_holders
-            + ") AND ("
+            + ") AND deleted_timestamp=0 AND ("
             "(official_first_seen_timestamp IS NOT NULL"
             " AND official_first_seen_timestamp > ?)"
             " OR (official_first_seen_timestamp IS NULL"
@@ -1930,7 +2251,8 @@ def evaluate_targets(config=None):
             for (enriched_id,) in cur.execute(
                 "SELECT DISTINCT program_id FROM assets WHERE program_id IN ("  # nosec B608
                 + batched_holders
-                + ") AND official_first_seen_timestamp IS NOT NULL",
+                + ") AND deleted_timestamp=0"
+                " AND official_first_seen_timestamp IS NOT NULL",
                 batched_ids,
             ).fetchall():
                 enriched_program_ids.add(enriched_id)
@@ -2191,6 +2513,7 @@ def cmd_filter(args, config):
     )
 
     conn = get_db()
+    ensure_schema(conn)
     for i, p in enumerate(results[:limit], 1):
         if p["response_time_known"]:
             triage_info = f"{p['first_resp']}h avg first response (HackerOne feed)"
@@ -2260,11 +2583,13 @@ def cmd_filter(args, config):
         if args.show_assets:
             cur = conn.cursor()
             wildcard_samples = cur.execute(
-                "SELECT asset_identifier FROM assets WHERE program_id=? AND is_wildcard=1 LIMIT 3",
+                "SELECT asset_identifier FROM assets WHERE program_id=?"
+                " AND is_wildcard=1 AND deleted_timestamp=0 LIMIT 3",
                 (p["id"],),
             ).fetchall()
             other_samples = cur.execute(
-                "SELECT asset_identifier FROM assets WHERE program_id=? AND is_wildcard=0 LIMIT 3",
+                "SELECT asset_identifier FROM assets WHERE program_id=?"
+                " AND is_wildcard=0 AND deleted_timestamp=0 LIMIT 3",
                 (p["id"],),
             ).fetchall()
 
@@ -2314,6 +2639,7 @@ def clean_asset_identifier(value):
 
 def cmd_check(args):
     conn = get_db()
+    ensure_schema(conn)
     target = (args.domain or "").strip().lower()
     cur = conn.cursor()
 
@@ -2323,6 +2649,7 @@ def cmd_check(args):
                a.asset_identifier, a.is_wildcard
         FROM assets a
         JOIN programs p ON a.program_id = p.id
+        WHERE a.deleted_timestamp=0
     """
     ).fetchall()
     matches = [
@@ -2357,14 +2684,14 @@ def cmd_export(args, config):
     target_ids = [p["id"] for p in results[:limit]]
 
     conn = get_db()
+    ensure_schema(conn)
     cur = conn.cursor()
     if not target_ids:
         return
     placeholders = ",".join("?" * len(target_ids))
     sql = (
-        "SELECT DISTINCT asset_identifier FROM assets WHERE program_id IN ("  # nosec B608
-        + placeholders
-        + ")"
+        "SELECT DISTINCT asset_identifier FROM assets WHERE deleted_timestamp=0"  # nosec B608
+        " AND program_id IN (" + placeholders + ")"
     )
     if args.wildcards_only:
         sql += " AND is_wildcard = 1"

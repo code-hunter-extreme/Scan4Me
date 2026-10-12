@@ -174,7 +174,8 @@ def test_sync_assets_reconciles_and_preserves_first_seen(tmp_path):
     }
     assert rows == {"*.example.com": 1000, "old.example.com": 1000}
 
-    # Resync: one kept (timestamp preserved), one added, one stale (deleted).
+    # Resync: one kept (timestamp preserved), one added, one stale
+    # (TOMBSTONED — retained with deleted_timestamp, hidden from live scope).
     scan4me.sync_assets(
         cur,
         program_id,
@@ -187,13 +188,250 @@ def test_sync_assets_reconciles_and_preserves_first_seen(tmp_path):
         2000,
     )
     conn.commit()
-    rows = {
+    live_rows = {
         r["asset_identifier"]: r["first_seen_timestamp"]
         for r in cur.execute(
             "SELECT asset_identifier, first_seen_timestamp FROM assets"
+            " WHERE deleted_timestamp=0"
         )
     }
-    assert rows == {"*.example.com": 1000, "new.example.com": 2000}
+    assert live_rows == {"*.example.com": 1000, "new.example.com": 2000}
+    tomb = cur.execute(
+        "SELECT asset_identifier, first_seen_timestamp, deleted_timestamp"
+        " FROM assets WHERE asset_identifier='old.example.com'"
+    ).fetchone()
+    assert tomb is not None  # not hard-deleted
+    assert tomb["first_seen_timestamp"] == 1000  # first-seen evidence kept
+    assert tomb["deleted_timestamp"] == 2000  # tombstone stamped
+    conn.close()
+
+
+def test_sync_truncation_tombstones_and_resurrects(tmp_path):
+    """Hole #11 truncation-safety: a truncated feed tombstones scope instead of
+    wiping it, and a restored feed resurrects rows with first-seen intact."""
+    conn = _temp_db(tmp_path / "t.db")
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO programs (platform, name, handle) VALUES (?, ?, ?)",
+        ("HackerOne", "Example", "example"),
+    )
+    program_id = cur.lastrowid
+    conn.commit()
+
+    full = [
+        {"asset_identifier": "a.example.com", "asset_type": "URL"},
+        {"asset_identifier": "b.example.com", "asset_type": "URL"},
+    ]
+    scan4me.sync_assets(cur, program_id, full, "asset_identifier", "asset_type", 1000)
+    conn.commit()
+
+    # Truncated feed: only one asset survives.
+    scan4me.sync_assets(
+        cur,
+        program_id,
+        [{"asset_identifier": "a.example.com", "asset_type": "URL"}],
+        "asset_identifier",
+        "asset_type",
+        2000,
+    )
+    conn.commit()
+    live = [
+        r["asset_identifier"]
+        for r in cur.execute(
+            "SELECT asset_identifier FROM assets WHERE deleted_timestamp=0"
+        )
+    ]
+    assert live == ["a.example.com"]
+    tomb = cur.execute(
+        "SELECT first_seen_timestamp, deleted_timestamp FROM assets"
+        " WHERE asset_identifier='b.example.com'"
+    ).fetchone()
+    assert (tomb["first_seen_timestamp"], tomb["deleted_timestamp"]) == (1000, 2000)
+
+    # Feed restored: resurrection keeps the ORIGINAL first-seen.
+    scan4me.sync_assets(cur, program_id, full, "asset_identifier", "asset_type", 3000)
+    conn.commit()
+    rows = {
+        r["asset_identifier"]: (
+            r["first_seen_timestamp"],
+            r["deleted_timestamp"],
+        )
+        for r in cur.execute("SELECT * FROM assets")
+    }
+    assert rows == {
+        "a.example.com": (1000, 0),
+        "b.example.com": (1000, 0),
+    }
+    conn.close()
+
+
+def test_sync_assets_stores_eligibility_flags(tmp_path):
+    """Hole #3: H1-style eligibility flags stored verbatim; feeds without the
+    keys default to eligible (unknown != forbidden)."""
+    conn = _temp_db(tmp_path / "t.db")
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO programs (platform, name, handle) VALUES (?, ?, ?)",
+        ("HackerOne", "Example", "example"),
+    )
+    program_id = cur.lastrowid
+    conn.commit()
+
+    scan4me.sync_assets(
+        cur,
+        program_id,
+        [
+            {
+                "asset_identifier": "ok.example.com",
+                "asset_type": "URL",
+                "eligible_for_bounty": True,
+                "eligible_for_submission": True,
+                "instruction": "",
+                "max_severity": "critical",
+            },
+            {
+                "asset_identifier": "nope.example.com",
+                "asset_type": "URL",
+                "eligible_for_bounty": False,
+                "eligible_for_submission": False,
+                "instruction": "Do not test",
+                "max_severity": "none",
+            },
+            # No eligibility keys (Bugcrowd-style) -> defaults to eligible.
+            {"asset_identifier": "plain.example.com", "asset_type": "URL"},
+        ],
+        "asset_identifier",
+        "asset_type",
+        1000,
+    )
+    conn.commit()
+    rows = {
+        r["asset_identifier"]: r
+        for r in cur.execute(
+            "SELECT asset_identifier, eligible_for_bounty,"
+            " eligible_for_submission, instruction, max_severity FROM assets"
+            " WHERE deleted_timestamp=0"
+        )
+    }
+    assert rows["ok.example.com"]["eligible_for_bounty"] == 1
+    assert rows["ok.example.com"]["eligible_for_submission"] == 1
+    assert rows["ok.example.com"]["max_severity"] == "critical"
+    assert rows["nope.example.com"]["eligible_for_bounty"] == 0
+    assert rows["nope.example.com"]["eligible_for_submission"] == 0
+    assert rows["nope.example.com"]["instruction"] == "Do not test"
+    assert rows["plain.example.com"]["eligible_for_bounty"] == 1
+    assert rows["plain.example.com"]["eligible_for_submission"] == 1
+    conn.close()
+
+
+def test_sync_oos_assets_stored_and_tombstoned(tmp_path):
+    """Hole #3: out-of-scope identifiers persist (tombstoned, never deleted)."""
+    conn = _temp_db(tmp_path / "t.db")
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO programs (platform, name, handle) VALUES (?, ?, ?)",
+        ("Bugcrowd", "Example", "example"),
+    )
+    program_id = cur.lastrowid
+    conn.commit()
+
+    scan4me.sync_oos_assets(
+        cur,
+        program_id,
+        [
+            {"target": "oos1.example.com", "type": "website"},
+            {"target": "oos2.example.com", "type": "website"},
+        ],
+        "target",
+        "type",
+        1000,
+    )
+    conn.commit()
+    live = [
+        r["asset_identifier"]
+        for r in cur.execute(
+            "SELECT asset_identifier FROM oos_assets WHERE deleted_timestamp=0"
+        )
+    ]
+    assert sorted(live) == ["oos1.example.com", "oos2.example.com"]
+
+    scan4me.sync_oos_assets(
+        cur,
+        program_id,
+        [{"target": "oos1.example.com", "type": "website"}],
+        "target",
+        "type",
+        2000,
+    )
+    conn.commit()
+    live = [
+        r["asset_identifier"]
+        for r in cur.execute(
+            "SELECT asset_identifier FROM oos_assets WHERE deleted_timestamp=0"
+        )
+    ]
+    assert live == ["oos1.example.com"]
+    tomb = cur.execute(
+        "SELECT first_seen_timestamp, deleted_timestamp FROM oos_assets"
+        " WHERE asset_identifier='oos2.example.com'"
+    ).fetchone()
+    assert (tomb["first_seen_timestamp"], tomb["deleted_timestamp"]) == (1000, 2000)
+    conn.close()
+
+
+def test_sync_program_scope_skips_absent_sides(tmp_path):
+    """Feeds omitting out_of_scope (auth fetchers) must not wipe OOS rows;
+    entries missing scope entirely must not wipe scope."""
+    conn = _temp_db(tmp_path / "t.db")
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO programs (platform, name, handle) VALUES (?, ?, ?)",
+        ("HackerOne", "Example", "example"),
+    )
+    program_id = cur.lastrowid
+    conn.commit()
+
+    entry = {
+        "targets": {
+            "in_scope": [{"asset_identifier": "a.example.com", "asset_type": "URL"}],
+            "out_of_scope": [
+                {"asset_identifier": "oos.example.com", "asset_type": "URL"}
+            ],
+        }
+    }
+    scan4me._sync_program_scope(
+        cur, program_id, entry, "asset_identifier", "asset_type", 1000
+    )
+    conn.commit()
+
+    # Auth-style entry: in_scope only -> OOS rows untouched.
+    scan4me._sync_program_scope(
+        cur,
+        program_id,
+        {"targets": {"in_scope": []}},
+        "asset_identifier",
+        "asset_type",
+        2000,
+    )
+    conn.commit()
+    assert (
+        cur.execute(
+            "SELECT count(*) FROM oos_assets WHERE deleted_timestamp=0"
+        ).fetchone()[0]
+        == 1
+    )
+    # Malformed entry: no targets at all -> scope untouched (tombstones nothing).
+    scan4me._sync_program_scope(
+        cur, program_id, {"handle": "example"}, "asset_identifier", "asset_type", 3000
+    )
+    conn.commit()
+    assert (
+        cur.execute(
+            "SELECT count(*) FROM assets WHERE deleted_timestamp=0"
+        ).fetchone()[0]
+        == 0  # in_scope [] tombstoned the 1 asset above; malformed adds nothing
+    )
+    assert cur.execute("SELECT count(*) FROM assets").fetchone()[0] == 1
     conn.close()
 
 
@@ -244,6 +482,189 @@ def test_sync_offline_missing_required_feed_raises(tmp_path, monkeypatch):
     (tmp_path / "cache" / "data" / "hackerone_data.json").unlink()
     with pytest.raises(FileNotFoundError):
         scan4me.sync_data(refresh=False, platforms_cfg=cfg, config={})
+
+
+def _no_auth(monkeypatch, tmp_path):
+    """Force the public-feed path: no env keys, no trio central keys."""
+    for var in (
+        "HACKERONE_USERNAME",
+        "HACKERONE_API_TOKEN",
+        "BUGCROWD_API_TOKEN",
+        "INTIGRITI_API_TOKEN",
+        "YESWEHACK_API_TOKEN",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(scan4me, "TRIO_KEYS_FILE", str(tmp_path / "no-keys.env"))
+
+
+def _h1_entry(handle="acme"):
+    return {
+        "handle": handle,
+        "name": "Acme",
+        "url": f"https://hackerone.com/{handle}",
+        "website": "https://acme.com",
+        "offers_bounties": True,
+        "managed_program": True,
+        "targets": {
+            "in_scope": [
+                {
+                    "asset_identifier": "app.acme.com",
+                    "asset_type": "URL",
+                    "eligible_for_bounty": True,
+                    "eligible_for_submission": True,
+                    "instruction": "",
+                    "max_severity": "critical",
+                },
+                {
+                    "asset_identifier": "legacy.acme.com",
+                    "asset_type": "URL",
+                    "eligible_for_bounty": False,
+                    "eligible_for_submission": False,
+                    "instruction": "Out of scope soon",
+                    "max_severity": "none",
+                },
+            ],
+            "out_of_scope": [
+                {"asset_identifier": "evil.acme.com", "asset_type": "URL"}
+            ],
+        },
+    }
+
+
+def _file_only_cfg(**overrides):
+    cfg = {
+        "hackerone": False,
+        "bugcrowd": False,
+        "intigriti": False,
+        "yeswehack": False,
+        "federacy": False,
+        "immunefi": False,
+        "sherlock": False,
+        "pd_programs": False,
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+def test_sync_records_metadata_and_eligibility(tmp_path, monkeypatch):
+    """Hole #5/#3 end of sync_data: upstream SHA + per-platform status land in
+    sync_metadata; eligibility flags + OOS identifiers land in the DB."""
+    _no_auth(monkeypatch, tmp_path)
+    monkeypatch.setattr(scan4me, "CACHE_DATA_DIR", tmp_path / "cache")
+    monkeypatch.setattr(scan4me, "DB_PATH", tmp_path / "t.db")
+    _write_feed(tmp_path / "cache" / "data", "hackerone_data.json", [_h1_entry()])
+    scan4me.sync_data(
+        refresh=False, platforms_cfg=_file_only_cfg(hackerone=True), config={}
+    )
+
+    conn = sqlite3.connect(str(tmp_path / "t.db"))
+    conn.row_factory = sqlite3.Row
+    try:
+        meta = {
+            r["key"]: r["value"]
+            for r in conn.execute("SELECT key, value FROM sync_metadata")
+        }
+        assert meta["upstream_sha"].startswith("unknown (no upstream checkout)")
+        assert meta["last_refresh_ok"] == "1"
+        assert int(meta["last_sync_ts"]) > 0
+        status = json.loads(meta["platform_status"])
+        assert status["hackerone"]["status"] == "ok"
+        assert status["hackerone"]["count"] == 1
+        assert status["hackerone"]["source"] == "public-file"
+        assert status["bugcrowd"]["status"] == "skipped"
+        assert status["pd_programs"]["status"] == "skipped"
+
+        flags = {
+            r["asset_identifier"]: (
+                r["eligible_for_bounty"],
+                r["eligible_for_submission"],
+            )
+            for r in conn.execute(
+                "SELECT asset_identifier, eligible_for_bounty,"
+                " eligible_for_submission FROM assets WHERE deleted_timestamp=0"
+            )
+        }
+        assert flags == {"app.acme.com": (1, 1), "legacy.acme.com": (0, 0)}
+        oos = [
+            r["asset_identifier"]
+            for r in conn.execute(
+                "SELECT asset_identifier FROM oos_assets WHERE deleted_timestamp=0"
+            )
+        ]
+        assert oos == ["evil.acme.com"]
+    finally:
+        conn.close()
+
+
+def test_failed_refresh_keeps_timestamps(tmp_path, monkeypatch):
+    """Hole #5: a failed `git pull` uses the cached snapshot WITHOUT bumping
+    last_updated_timestamp, and records the failure in sync_metadata."""
+    import subprocess as _sp
+
+    _no_auth(monkeypatch, tmp_path)
+    monkeypatch.setattr(scan4me, "CACHE_DATA_DIR", tmp_path / "cache")
+    monkeypatch.setattr(scan4me, "DB_PATH", tmp_path / "t.db")
+    monkeypatch.setattr(scan4me.shutil, "which", lambda _b: "/usr/bin/git")
+
+    repo_data = tmp_path / "cache" / "repo" / "data"
+    _write_feed(repo_data, "hackerone_data.json", [_h1_entry()])
+    (tmp_path / "cache" / "repo" / ".git").mkdir(parents=True)
+
+    def _fake_run(cmd, **kwargs):
+        if "rev-parse" in cmd:
+            return types.SimpleNamespace(stdout="abc1234\n", stderr="", returncode=0)
+        raise _sp.CalledProcessError(128, cmd, output="", stderr="pull failed")
+
+    monkeypatch.setattr(scan4me.subprocess, "run", _fake_run)
+
+    # Seed one existing program with an old stamp (past baseline so the
+    # baseline pass doesn't rewrite first_seen).
+    conn = _temp_db(tmp_path / "t.db")
+    conn.execute(
+        "INSERT INTO programs (platform, name, handle, first_seen_timestamp,"
+        " last_updated_timestamp) VALUES (?, ?, ?, ?, ?)",
+        ("HackerOne", "Acme", "acme", 500, 1000),
+    )
+    conn.execute(
+        "INSERT INTO sync_metadata(key, value) VALUES('baseline_complete', '1')"
+    )
+    conn.commit()
+    conn.close()
+
+    scan4me.sync_data(
+        refresh=True, platforms_cfg=_file_only_cfg(hackerone=True), config={}
+    )
+
+    conn = sqlite3.connect(str(tmp_path / "t.db"))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT first_seen_timestamp, last_updated_timestamp FROM programs"
+            " WHERE platform='HackerOne' AND handle='acme'"
+        ).fetchone()
+        assert row["first_seen_timestamp"] == 500
+        assert row["last_updated_timestamp"] == 1000  # NOT bumped on stale data
+        meta = {
+            r["key"]: r["value"]
+            for r in conn.execute("SELECT key, value FROM sync_metadata")
+        }
+        assert meta["last_refresh_ok"] == "0"
+        assert meta["upstream_sha"] == "abc1234"
+        assert "non-zero exit status 128" in meta["last_refresh_error"]
+    finally:
+        conn.close()
+
+
+def test_platform_status_and_row_stamp_units():
+    assert scan4me._platform_status(False, [1], "x")["status"] == "skipped"
+    assert scan4me._platform_status(True, [], "authenticated", True)["status"] \
+        == "auth_empty"
+    assert scan4me._platform_status(True, [], "public-file")["status"] == "empty"
+    ok = scan4me._platform_status(True, [1, 2], "public-file")
+    assert (ok["status"], ok["count"]) == ("ok", 2)
+    assert scan4me._row_last_updated(None, 2000, False) == 2000
+    assert scan4me._row_last_updated((7, 500, 1000), 2000, True) == 2000
+    assert scan4me._row_last_updated((7, 500, 1000), 2000, False) == 1000
 
 
 # ── trio central key store ────────────────────────────────────────────────
