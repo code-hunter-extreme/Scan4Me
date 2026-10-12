@@ -30,9 +30,9 @@ CACHE_DATA_DIR = REPO_ROOT / "data_cache"
 UPSTREAM_REPO = "https://github.com/arkadiyt/bounty-targets-data.git"
 # Secondary feed: projectdiscovery/public-bugbounty-programs (machine-readable scope JSON)
 PD_PROGRAMS_REPO = "https://github.com/projectdiscovery/public-bugbounty-programs.git"
-# Immunefi: no stable public JSON API exists — fetcher always soft-fails gracefully.
-# Set to None to skip without a network attempt; point to a community mirror when one emerges.
-IMMUNEFI_API_URL = None
+# Immunefi: no public JSON API — but the bug-bounty board page embeds the full
+# bounty list as escaped JSON (verified 2026-10-12: 169 bounties). No auth needed.
+IMMUNEFI_BOUNTIES_URL = "https://immunefi.com/bug-bounty/"
 # Sherlock audit contest API (Web3 smart contract audit contests — confirmed public, paginated)
 SHERLOCK_API_URL = "https://audits.sherlock.xyz/api/contests"
 
@@ -837,75 +837,151 @@ def enrich_bugcrowd_program(conn, program_id, handle, now_ts=None):
     }
 
 
-def _fetch_immunefi_programs():
-    """Fetch Immunefi bug bounty program list from their public JSON feed.
+def _js_unescape_once(text):
+    """Decode one layer of JS string escapes (\\", \\\\, \\n, \\/, \\uXXXX)."""
+    out = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            if nxt == "n":
+                out.append("\n")
+                i += 2
+            elif nxt == "t":
+                out.append("\t")
+                i += 2
+            elif nxt == "r":
+                out.append("\r")
+                i += 2
+            elif nxt in '"\\/':
+                out.append(nxt)
+                i += 2
+            elif nxt == "u" and i + 5 < len(text):
+                hex_start = i + 2
+                hex_end = i + 6
+                try:
+                    out.append(chr(int(text[hex_start:hex_end], 16)))
+                    i += 6
+                except ValueError:
+                    out.append(ch)
+                    i += 1
+            else:
+                out.append(ch)
+                i += 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
-    Immunefi has no stable public JSON API — IMMUNEFI_API_URL is None until a
-    reliable community mirror is identified.  Always returns [] gracefully.
+
+def _extract_bracketed_array(text, start):
+    """Return the raw [...] slice starting at index start (escape-aware).
+
+    Returns None when no balanced closing bracket is found.
     """
-    if not IMMUNEFI_API_URL:
-        print("[*] Immunefi: no public JSON API available — skipping.")
+    depth = 0
+    in_str = False
+    esc = False
+    for j in range(start, len(text)):
+        ch = text[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                end = j + 1
+                return text[start:end]
+    return None
+
+
+def _parse_immunefi_page(html):
+    """Extract the embedded bounty list from the Immunefi board page.
+
+    The page embeds React Flight data containing `"bounties":[...]` with one
+    record per program (project, slug, url, maxBounty, pausedAt, inviteOnly).
+    Returns the raw record list, or [] when the payload is absent/unparseable.
+    """
+    key = '"bounties\\":['
+    at = html.find(key)
+    if at < 0:
+        return []
+    raw = _extract_bracketed_array(html, at + len(key) - 1)
+    if not raw:
         return []
     try:
+        decoded = _js_unescape_once(_js_unescape_once(raw))
+        records, _ = json.JSONDecoder().raw_decode(decoded)
+    except ValueError:
+        return []
+    return records if isinstance(records, list) else []
+
+
+def _normalize_immunefi_record(item):
+    """Normalize one embedded Immunefi bounty record to the program schema.
+
+    Returns None when the record has no usable project name. Paused and
+    invite-only programs are kept but marked offers_bounties=False since they
+    are not actionable for a public hunter. Per-program scope lives on the
+    detail pages, so assets is always [] (see P5 live-sync recipe).
+    """
+    name = item.get("project") or item.get("name") or ""
+    if not name:
+        return None
+    slug = item.get("slug") or ""
+    handle = slug or name.lower().replace(" ", "-").replace(".", "-")
+    path = item.get("url") or f"/bug-bounty/{handle}/"
+    url = path if path.startswith("http") else f"https://immunefi.com{path}"
+    try:
+        max_p = float(item.get("maxBounty") or 0)
+    except (ValueError, TypeError):
+        max_p = 0.0
+    actionable = item.get("pausedAt") is None and not item.get("inviteOnly", False)
+    return {
+        "name": name,
+        "handle": handle,
+        "url": url,
+        "max_payout": max_p,
+        "currency": "USD",
+        "offers_bounties": bool(max_p > 0 and actionable),
+        "assets": [],
+    }
+
+
+def _fetch_immunefi_programs(url=None):
+    """Fetch the Immunefi bug bounty list from their public board page.
+
+    The board embeds the full bounty list as escaped JSON — no API key needed.
+    Returns [] on any fetch/parse failure (soft-fail, like other live feeds).
+    """
+    url = url or IMMUNEFI_BOUNTIES_URL
+    try:
         req = urllib.request.Request(
-            IMMUNEFI_API_URL,
+            url,
             headers={"User-Agent": "Scan4Me public bug-bounty metadata sync"},
         )
         with urllib.request.urlopen(req, timeout=20) as resp:  # nosec B310
-            data = json.load(resp)
+            html = resp.read().decode("utf-8", errors="replace")
     except Exception as e:
         print(f"[!] Immunefi fetch skipped: {e}")
         return []
 
-    if isinstance(data, dict):
-        data = data.get("bounties", data.get("data", []))
-    if not isinstance(data, list):
-        return []
-
     programs = []
-    for item in data:
-        name = item.get("project") or item.get("name") or ""
-        if not name:
+    for item in _parse_immunefi_page(html):
+        if not isinstance(item, dict):
             continue
-        handle = name.lower().replace(" ", "-").replace(".", "-")
-        url = item.get("url") or f"https://immunefi.com/bounty/{handle}/"
-        raw_max = (
-            item.get("maximumReward")
-            or item.get("maxBounty")
-            or item.get("max_payout")
-            or 0
-        )
-        try:
-            max_p = float(str(raw_max).replace(",", "").replace("$", "").strip() or 0)
-        except (ValueError, TypeError):
-            max_p = 0.0
-        offers_bounty = max_p > 0 or bool(item.get("active", True))
-        raw_assets = item.get("assets") or item.get("scope") or []
-        asset_ids = []
-        if isinstance(raw_assets, list):
-            for a in raw_assets:
-                if isinstance(a, dict):
-                    ident = a.get("address") or a.get("url") or a.get("target") or ""
-                elif isinstance(a, str):
-                    ident = a
-                else:
-                    ident = ""
-                ident = ident.strip()
-                if ident:
-                    asset_ids.append(ident)
-        elif isinstance(raw_assets, str) and raw_assets.strip():
-            asset_ids.append(raw_assets.strip())
-        programs.append(
-            {
-                "name": name,
-                "handle": handle,
-                "url": url,
-                "max_payout": max_p,
-                "currency": "USD",
-                "offers_bounties": offers_bounty,
-                "assets": asset_ids,
-            }
-        )
+        norm = _normalize_immunefi_record(item)
+        if norm:
+            programs.append(norm)
     return programs
 
 
@@ -982,6 +1058,39 @@ def _contest_ts(value):
     return str(value)
 
 
+def _load_pd_programs(repo_dir):
+    """Load the program list from a projectdiscovery/public-bugbounty-programs checkout.
+
+    Prefers the generated dist/data.json; falls back to src/data.yaml.
+    Returns [] when neither exists or neither parses (soft-fail).
+    """
+    repo_dir = Path(repo_dir)
+    json_file = repo_dir / "dist" / "data.json"
+    if json_file.is_file():
+        try:
+            with open(json_file, encoding="utf-8") as f:
+                raw = json.load(f)
+            programs = raw if isinstance(raw, list) else raw.get("programs", [])
+            return programs if isinstance(programs, list) else []
+        except (OSError, UnicodeDecodeError, ValueError) as e:
+            print(f"[!] ProjectDiscovery dist/data.json parse error: {e}")
+    yaml_file = repo_dir / "src" / "data.yaml"
+    if yaml_file.is_file():
+        try:
+            import yaml  # type: ignore[import-untyped]  # lazy: optional dep
+        except ImportError:
+            print("[*] ProjectDiscovery: PyYAML missing, cannot read src/data.yaml.")
+            return []
+        try:
+            with open(yaml_file, encoding="utf-8") as f:
+                raw = yaml.safe_load(f)
+            programs = raw if isinstance(raw, list) else (raw or {}).get("programs", [])
+            return programs if isinstance(programs, list) else []
+        except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as e:
+            print(f"[!] ProjectDiscovery src/data.yaml parse error: {e}")
+    return []
+
+
 def sync_data(refresh=True, platforms_cfg=None, config=None):
     """Sync all enabled feed sources into the local SQLite database.
 
@@ -999,7 +1108,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
       YesWeHack  — api.yeswehack.com/programs             (Bearer token)
 
     Optional live feeds (fetched directly, no auth needed):
-      Immunefi  — no public API yet; skipped gracefully
+      Immunefi  — bug-bounty board page (embedded JSON, web3)
       Sherlock  — paginated audit contest API (web3)
 
     Supplemental feed (projectdiscovery/public-bugbounty-programs):
@@ -1569,19 +1678,14 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
             pd_repo_dir = None
 
         if pd_repo_dir and pd_repo_dir.exists():
-            pd_file = pd_repo_dir / "chaos-bugbounty-list.json"
-            if pd_file.exists():
+            pd_programs_list = _load_pd_programs(pd_repo_dir)
+            if pd_programs_list:
                 try:
-                    with open(pd_file, encoding="utf-8") as f:
-                        pd_raw = json.load(f)
-                    pd_programs_list = (
-                        pd_raw
-                        if isinstance(pd_raw, list)
-                        else pd_raw.get("programs", [])
-                    )
                     count = 0
                     with conn:
                         for p in pd_programs_list:
+                            if not isinstance(p, dict):
+                                continue
                             name = p.get("name", "")
                             if not name:
                                 continue
@@ -1629,11 +1733,12 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                             sync_assets(cur, prog_id, domain_targets, "d", "t", now_ts)
                             count += 1
                     print(f"[+] ProjectDiscovery programs indexed: {count} programs.")
-                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
-                    print(f"[!] ProjectDiscovery feed parse error — skipping: {e}")
+                except sqlite3.Error as e:
+                    print(f"[!] ProjectDiscovery DB index error — skipping: {e}")
             else:
                 print(
-                    "[*] ProjectDiscovery: chaos-bugbounty-list.json not found in cloned repo."
+                    "[*] ProjectDiscovery: no programs loaded"
+                    " (dist/data.json + src/data.yaml missing or unparseable)."
                 )
 
     if is_baseline_sync:
@@ -2475,7 +2580,7 @@ def main():
             "intigriti": "✅ Active API (Bearer token)",
             "yeswehack": "✅ Active API (Bearer token)",
             "federacy": "⏳ No API yet — slot reserved",
-            "immunefi": "⏳ No public API yet — slot reserved",
+            "immunefi": "🌐 Public board page (no auth needed)",
             "sherlock": "🌐 Public API (no auth needed)",
             "hackenproof": "⏳ No API detected — slot reserved",
             "bugbase": "⏳ No API yet — slot reserved",

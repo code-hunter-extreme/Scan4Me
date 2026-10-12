@@ -652,3 +652,369 @@ def test_p6_scoring_composite_unchanged(tmp_path, monkeypatch):
             "🔍 NARROW/FOCUSED",
         ),
     ]
+
+
+# ── P5: Immunefi + PDPrograms feed repair ─────────────────────────────────────
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def test_p5_immunefi_parse_fixture():
+    """Fixture (3 records cut from the live board page) parses exactly."""
+    html = (FIXTURES / "immunefi_page_excerpt.html").read_text(encoding="utf-8")
+    records = scan4me._parse_immunefi_page(html)
+    assert [r["project"] for r in records] == [
+        "LayerZero",
+        "Paused Project",
+        "Invite Only Project",
+    ]
+    programs = [scan4me._normalize_immunefi_record(r) for r in records]
+    assert programs[0] == {
+        "name": "LayerZero",
+        "handle": "layerzero",
+        "url": "https://immunefi.com/bug-bounty/layerzero/information/",
+        "max_payout": 15000000.0,
+        "currency": "USD",
+        "offers_bounties": True,
+        "assets": [],
+    }
+    # Paused and invite-only programs are kept but not actionable.
+    assert programs[1]["offers_bounties"] is False
+    assert programs[2]["offers_bounties"] is False
+    assert scan4me._normalize_immunefi_record({"slug": "x"}) is None
+
+
+def test_p5_immunefi_parse_garbage_returns_empty():
+    assert scan4me._parse_immunefi_page("<html>no payload here</html>") == []
+    assert scan4me._parse_immunefi_page('"bounties\\":[') == []
+    assert scan4me._parse_immunefi_page('"bounties\\":[not json') == []
+
+
+class _FakeHTTPResp:
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_p5_immunefi_fetch_uses_board_url(monkeypatch):
+    """Fetcher hits IMMUNEFI_BOUNTIES_URL and normalizes the payload."""
+    html = (FIXTURES / "immunefi_page_excerpt.html").read_bytes()
+    seen = {}
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["ua"] = req.get_header("User-agent")
+        return _FakeHTTPResp(html)
+
+    monkeypatch.setattr(scan4me.urllib.request, "urlopen", fake_urlopen)
+    programs = scan4me._fetch_immunefi_programs()
+    assert seen["url"] == scan4me.IMMUNEFI_BOUNTIES_URL
+    assert seen["ua"] == "Scan4Me public bug-bounty metadata sync"
+    assert len(programs) == 3
+    assert programs[0]["handle"] == "layerzero"
+
+
+def test_p5_immunefi_fetch_network_failure_soft_fails(monkeypatch):
+    def boom(req, timeout=None):
+        raise OSError("network down")
+
+    monkeypatch.setattr(scan4me.urllib.request, "urlopen", boom)
+    assert scan4me._fetch_immunefi_programs() == []
+
+
+def test_p5_pd_load_prefers_dist_json(tmp_path):
+    repo = tmp_path / "pd"
+    (repo / "dist").mkdir(parents=True)
+    (repo / "dist" / "data.json").write_text(
+        json.dumps(
+            {
+                "programs": [
+                    {
+                        "name": "Json Corp",
+                        "url": "https://example.com/sec",
+                        "bounty": True,
+                        "domains": ["example.com"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    # A stale yaml must NOT shadow dist/data.json.
+    (repo / "src").mkdir()
+    (repo / "src" / "data.yaml").write_text(
+        "programs:\n  - name: Yaml Corp\n", encoding="utf-8"
+    )
+    programs = scan4me._load_pd_programs(repo)
+    assert [p["name"] for p in programs] == ["Json Corp"]
+
+
+def test_p5_pd_load_yaml_fallback(tmp_path):
+    repo = tmp_path / "pd"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "data.yaml").write_text(
+        "programs:\n"
+        "  - name: Yaml Corp\n"
+        "    url: https://example.com/sec\n"
+        "    bounty: false\n"
+        "    domains:\n"
+        "      - example.com\n",
+        encoding="utf-8",
+    )
+    programs = scan4me._load_pd_programs(repo)
+    assert [p["name"] for p in programs] == ["Yaml Corp"]
+
+
+def test_p5_pd_load_missing_returns_empty(tmp_path):
+    assert scan4me._load_pd_programs(tmp_path / "empty") == []
+
+
+def test_p5_sync_indexes_immunefi_and_pd(tmp_path, monkeypatch):
+    """End-to-end sync wiring: Immunefi page + PD checkout → program rows."""
+    cache = tmp_path / "cache"
+    (cache / "repo" / "data").mkdir(parents=True)
+    pd_repo = cache / "pd_programs_repo"
+    (pd_repo / ".git").mkdir(parents=True)
+    (pd_repo / "dist").mkdir(parents=True)
+    (pd_repo / "dist" / "data.json").write_text(
+        json.dumps(
+            {
+                "programs": [
+                    {
+                        "name": "PD Corp",
+                        "url": "https://hackerone.com/pdcorp",
+                        "bounty": True,
+                        "domains": ["pdcorp.com", "*.pdcorp.com"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(scan4me, "CACHE_DATA_DIR", cache)
+    monkeypatch.setattr(scan4me, "DB_PATH", tmp_path / "t.db")
+    monkeypatch.setattr(
+        scan4me.subprocess, "run", lambda *a, **k: None
+    )  # git pull/clone → no-op
+    html = (FIXTURES / "immunefi_page_excerpt.html").read_bytes()
+    monkeypatch.setattr(
+        scan4me.urllib.request,
+        "urlopen",
+        lambda req, timeout=None: _FakeHTTPResp(html),
+    )
+    cfg = {
+        "hackerone": False,
+        "bugcrowd": False,
+        "intigriti": False,
+        "yeswehack": False,
+        "federacy": False,
+        "immunefi": True,
+        "sherlock": False,
+        "pd_programs": True,
+    }
+    scan4me.sync_data(refresh=True, platforms_cfg=cfg, config={})
+    conn = sqlite3.connect(str(tmp_path / "t.db"))
+    conn.row_factory = sqlite3.Row
+    try:
+        imm = conn.execute(
+            "SELECT handle, max_payout, offers_bounties FROM programs"
+            " WHERE platform='Immunefi' ORDER BY handle"
+        ).fetchall()
+        assert [tuple(r) for r in imm] == [
+            ("invite-only-project", 15000000.0, 0),
+            ("layerzero", 15000000.0, 1),
+            ("paused-project", 15000000.0, 0),
+        ]
+        pd = conn.execute(
+            "SELECT name, offers_bounties FROM programs WHERE platform='PDPrograms'"
+        ).fetchall()
+        assert [tuple(r) for r in pd] == [("PD Corp", 1)]
+        assets = conn.execute(
+            "SELECT asset_identifier, is_wildcard FROM assets ORDER BY asset_identifier"
+        ).fetchall()
+        assert [tuple(r) for r in assets] == [
+            ("*.pdcorp.com", 1),
+            ("pdcorp.com", 0),
+        ]
+    finally:
+        conn.close()
+
+
+# ── P5: authenticated API paths (mocked transport, recorded contract) ─────────
+# Live-run recipe (keys + expected counts) lives in P5_LIVE_SYNC_RECIPE.md.
+
+
+def test_p5_h1_authenticated_pagination_and_auth(monkeypatch):
+    calls = []
+
+    def fake_api(url, **kw):
+        calls.append((url, kw))
+        if "number%5D=1" in url:
+            return {
+                "data": [
+                    {
+                        "attributes": {
+                            "handle": "acme",
+                            "name": "Acme",
+                            "offers_bounties": True,
+                            "structured_scopes": [
+                                {
+                                    "asset_identifier": "acme.com",
+                                    "asset_type": "URL",
+                                    "eligible_for_submission": True,
+                                },
+                                {
+                                    "asset_identifier": "internal.acme.com",
+                                    "asset_type": "URL",
+                                    "eligible_for_submission": False,
+                                },
+                            ],
+                        }
+                    }
+                ],
+                "links": {
+                    "next": "https://api.hackerone.com/v1/hackers/programs?page=2"
+                },
+            }
+        return {"data": [{"attributes": {"handle": "beta"}}], "links": {}}
+
+    monkeypatch.setattr(scan4me, "_api_request", fake_api)
+    programs = scan4me._fetch_h1_authenticated("user", "tok")
+    assert len(calls) == 2  # followed the `next` link exactly once
+    assert all(kw["auth_basic"] == ("user", "tok") for _, kw in calls)
+    assert calls[0][0].startswith(f"{scan4me.H1_API_BASE}/hackers/programs")
+    assert programs[0]["handle"] == "acme"
+    assert programs[0]["url"] == "https://hackerone.com/acme"
+    # Only eligible scopes become targets.
+    assert programs[0]["targets"]["in_scope"] == [
+        {"asset_identifier": "acme.com", "asset_type": "URL"}
+    ]
+    assert programs[1]["handle"] == "beta"
+
+
+def test_p5_h1_authenticated_failure_soft_fails(monkeypatch):
+    def boom(url, **kw):
+        raise OSError("bad credentials")
+
+    monkeypatch.setattr(scan4me, "_api_request", boom)
+    assert scan4me._fetch_h1_authenticated("user", "bad") == []
+
+
+def test_p5_bugcrowd_authenticated(monkeypatch):
+    calls = []
+
+    def fake_api(url, **kw):
+        calls.append((url, kw))
+        return {
+            "data": [
+                {
+                    "attributes": {
+                        "name": "BC Corp",
+                        "code": "bccorp",
+                        "url": "/bccorp",
+                        "max_payout": 5000,
+                        "targets": {
+                            "in_scope": [{"target": "bccorp.com", "type": "website"}]
+                        },
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(scan4me, "_api_request", fake_api)
+    programs = scan4me._fetch_bugcrowd_authenticated("tok")
+    assert len(calls) == 1  # <25 items → single page
+    assert calls[0][0].startswith(f"{scan4me.BUGCROWD_API_BASE}/engagements")
+    assert calls[0][1]["token_header"] == "tok"
+    assert programs[0]["url"] == "https://bugcrowd.com/bccorp"
+    assert programs[0]["max_payout"] == 5000.0
+
+
+def test_p5_intigriti_authenticated(monkeypatch):
+    calls = []
+
+    def fake_api(url, **kw):
+        calls.append((url, kw))
+        return {
+            "records": [
+                {
+                    "handle": "inticorp",
+                    "name": "Inti Corp",
+                    "maxBounty": {"value": 10000, "currency": "EUR"},
+                    "domains": [{"endpoint": "inticorp.com", "type": "url"}],
+                }
+            ],
+            "total": 1,
+        }
+
+    monkeypatch.setattr(scan4me, "_api_request", fake_api)
+    programs = scan4me._fetch_intigriti_authenticated("tok")
+    assert len(calls) == 1
+    assert "/researcher/programs" in calls[0][0]
+    assert calls[0][1]["bearer"] == "tok"
+    assert programs[0]["max_bounty"] == {"value": 10000.0, "currency": "EUR"}
+    assert programs[0]["targets"]["in_scope"] == [
+        {"endpoint": "inticorp.com", "type": "url"}
+    ]
+
+
+def test_p5_yeswehack_authenticated(monkeypatch):
+    calls = []
+
+    def fake_api(url, **kw):
+        calls.append((url, kw))
+        return {
+            "items": [
+                {
+                    "slug": "ywhcorp",
+                    "title": "YWH Corp",
+                    "scope": [{"scope": "ywhcorp.com", "type": "web"}],
+                }
+            ],
+            "pagination": {"nb_pages": 1},
+        }
+
+    monkeypatch.setattr(scan4me, "_api_request", fake_api)
+    programs = scan4me._fetch_yeswehack_authenticated("tok")
+    assert len(calls) == 1
+    assert calls[0][0].startswith(f"{scan4me.YESWEHACK_API_BASE}/programs")
+    assert calls[0][1]["bearer"] == "tok"
+    assert programs[0]["targets"]["in_scope"] == [
+        {"target": "ywhcorp.com", "target_type": "web"}
+    ]
+
+
+def test_p5_api_request_auth_headers(monkeypatch):
+    seen = {}
+
+    class _JsonResp:
+        def read(self):
+            return '{"ok": true}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        seen["auth"] = req.get_header("Authorization")
+        return _JsonResp()
+
+    monkeypatch.setattr(scan4me.urllib.request, "urlopen", fake_urlopen)
+    scan4me._api_request("https://x.test", auth_basic=("u", "t"))
+    import base64
+
+    assert seen["auth"] == "Basic " + base64.b64encode(b"u:t").decode()
+    scan4me._api_request("https://x.test", bearer="tok")
+    assert seen["auth"] == "Bearer tok"
+    scan4me._api_request("https://x.test", token_header="tok")
+    assert seen["auth"] == "Token tok"
