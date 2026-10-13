@@ -14,3 +14,4 @@ config.json
 credentials.json
 .env
 .env.local
+*.bak
