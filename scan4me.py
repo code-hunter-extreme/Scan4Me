@@ -442,9 +442,9 @@ DEFAULT_CONFIG = {
         "pd_programs": True,
     },
     "ranking_weights": {
-        "triage_speed": 0.40,
-        "attack_surface_size": 0.20,
-        "freshness_and_low_saturation": 0.25,
+        "triage_speed": 0.35,
+        "attack_surface_size": 0.30,
+        "freshness_and_low_saturation": 0.20,
         "payout_size": 0.15,
     },
     "display": {"limit": 25, "show_company_profile": True, "show_assets_sample": True},

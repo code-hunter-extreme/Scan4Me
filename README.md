@@ -28,7 +28,7 @@ flowchart TD
         PARSE["Scope & Company Extractor\n(Name, Website, Policy URL, Safe Harbor)"]
         SURFACE["Surface Area Calculator\n(Assets + Wildcards * Multiplier)"]
         TRIAGE["SLA Triage Analyzer\n(Response Time & Efficiency %)"]
-        SCORE["Composite Fast-Money Algorithm\n(Speed 40% • Surface 20% • Freshness 25% • Payout 15%)"]
+        SCORE["Composite Fast-Money Algorithm\n(Speed 35% • Surface 30% • Freshness 20% • Payout 15%)"]
     end
 
     subgraph CONFIG["3. User Hunter Config (config.json)"]
