@@ -3103,6 +3103,30 @@ def scope_match(target, asset_identifier, is_wildcard):
     return False
 
 
+def _ip_matches_rule(target, rule_identifier) -> bool:
+    """True when ``target`` is an IP address contained in ``rule_identifier``.
+
+    ``rule_identifier`` may be a CIDR ('10.0.0.0/8') or a bare IP ('10.1.2.3').
+    Used for out-of-scope exclusions: ``scope_match`` compares hosts as strings,
+    so a CIDR exclusion would never catch an individual address inside it and
+    that address would be wrongly reported as authorized. Returns False for any
+    non-IP target or unparseable rule — it only ever adds an exclusion, never
+    removes one.
+    """
+    try:
+        ip = ipaddress.ip_address((target or "").strip())
+    except ValueError:
+        return False
+    rule = (rule_identifier or "").strip()
+    try:
+        return ip in ipaddress.ip_network(rule, strict=False)
+    except ValueError:
+        try:
+            return ip == ipaddress.ip_address(rule)
+        except ValueError:
+            return False
+
+
 def clean_asset_identifier(value):
     """Bare host for recon-tool piping: no scheme, path, port, or star."""
     host, _, _, ok = canonicalize_asset(value, "url")
@@ -3140,17 +3164,35 @@ def cmd_check(args):
 
     # Live out-of-scope exclusions win over an in-scope wildcard: a target that
     # matches an explicit oos_assets rule for the same program is NOT authorized.
+    # Cache the verdict per program_id — several in-scope assets can belong to
+    # one program, and the exclusion set is identical for all of them.
+    oos_cache = {}
+
     def _is_oos(program_id) -> bool:
+        if program_id in oos_cache:
+            return oos_cache[program_id]
+        verdict = False
         for row in cur.execute(
             "SELECT asset_identifier, is_wildcard FROM oos_assets "
             "WHERE program_id=? AND deleted_timestamp=0",
             (program_id,),
         ).fetchall():
-            if scope_match(target, row["asset_identifier"], row["is_wildcard"]):
-                return True
-        return False
+            if scope_match(target, row["asset_identifier"], row["is_wildcard"]) or (
+                _ip_matches_rule(target, row["asset_identifier"])
+            ):
+                verdict = True
+                break
+        oos_cache[program_id] = verdict
+        return verdict
 
-    matches = [m for m in in_scope if not _is_oos(m["program_id"])][:10]
+    # Keep the first ten authorized matches; stop scanning once we have them.
+    matches = []
+    for m in in_scope:
+        if _is_oos(m["program_id"]):
+            continue
+        matches.append(m)
+        if len(matches) >= 10:
+            break
 
     if matches:
         print(
