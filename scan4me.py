@@ -2463,6 +2463,7 @@ def evaluate_targets(config=None):
         "SELECT p.*, count(a.id) as asset_count, sum(a.is_wildcard) as wildcard_count "  # nosec B608
         "FROM programs p "
         "LEFT JOIN assets a ON p.id = a.program_id "
+        "AND a.deleted_timestamp=0 "
         "WHERE p.platform IN (" + plat_holders + ")"
     )
     params = list(target_plats)
@@ -3124,18 +3125,32 @@ def cmd_check(args):
 
     candidates = cur.execute(
         """
-        SELECT p.platform, p.name, p.url, p.website, p.offers_bounties,
-               a.asset_identifier, a.is_wildcard
+        SELECT p.id AS program_id, p.platform, p.name, p.url, p.website,
+               p.offers_bounties, a.asset_identifier, a.is_wildcard
         FROM assets a
         JOIN programs p ON a.program_id = p.id
         WHERE a.deleted_timestamp=0
     """
     ).fetchall()
-    matches = [
+    in_scope = [
         m
         for m in candidates
         if scope_match(target, m["asset_identifier"], m["is_wildcard"])
-    ][:10]
+    ]
+
+    # Live out-of-scope exclusions win over an in-scope wildcard: a target that
+    # matches an explicit oos_assets rule for the same program is NOT authorized.
+    def _is_oos(program_id) -> bool:
+        for row in cur.execute(
+            "SELECT asset_identifier, is_wildcard FROM oos_assets "
+            "WHERE program_id=? AND deleted_timestamp=0",
+            (program_id,),
+        ).fetchall():
+            if scope_match(target, row["asset_identifier"], row["is_wildcard"]):
+                return True
+        return False
+
+    matches = [m for m in in_scope if not _is_oos(m["program_id"])][:10]
 
     if matches:
         print(
