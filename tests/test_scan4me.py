@@ -1808,21 +1808,25 @@ def test_feed_provenance_marks_stale_and_unknown(tmp_path):
 # ── cmd_check: out-of-scope exclusion (Greptile PR#2 regression) ──────────────
 
 
-def _seed_program(conn, platform, name, handle):
+def _seed_program(conn, platform, name, handle, offers_bounties=1):
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO programs(platform, name, handle, url, offers_bounties) "
-        "VALUES(?,?,?,?,1)",
-        (platform, name, handle, f"https://example/{handle}"),
+        "VALUES(?,?,?,?,?)",
+        (platform, name, handle, f"https://example/{handle}", offers_bounties),
     )
     return cur.lastrowid
 
 
-def _add_asset(conn, program_id, identifier, is_wildcard=0, deleted=0):
+def _add_asset(
+    conn, program_id, identifier, is_wildcard=0, deleted=0,
+    eligible_for_submission=1, eligible_for_bounty=1,
+):
     conn.execute(
-        "INSERT INTO assets(program_id, asset_identifier, is_wildcard, deleted_timestamp) "
-        "VALUES(?,?,?,?)",
-        (program_id, identifier, is_wildcard, deleted),
+        "INSERT INTO assets(program_id, asset_identifier, is_wildcard, deleted_timestamp, "
+        "eligible_for_submission, eligible_for_bounty) VALUES(?,?,?,?,?,?)",
+        (program_id, identifier, is_wildcard, deleted,
+         eligible_for_submission, eligible_for_bounty),
     )
 
 
@@ -1884,3 +1888,64 @@ def test_cmd_check_caps_at_ten_matches(tmp_path, monkeypatch, capsys):
         _add_asset(conn, pid, "shared.example.com")
     out = _run_check(tmp_path, monkeypatch, capsys, conn, "shared.example.com")
     assert "matches 10 program(s)" in out
+
+
+# ── cmd_check / cmd_export: eligibility flags (Greptile PR#2 issue 3) ──────────
+
+
+def test_cmd_check_rejects_submission_ineligible_asset(tmp_path, monkeypatch, capsys):
+    """A target whose only matching asset is submission-ineligible is NOT authorized."""
+    conn = _temp_db(tmp_path / "t.db")
+    pid = _seed_program(conn, "hackerone", "Acme", "acme")
+    _add_asset(conn, pid, "api.acme.com", eligible_for_submission=0)
+    out = _run_check(tmp_path, monkeypatch, capsys, conn, "api.acme.com")
+    assert "NOT IN KNOWN SCOPE" in out
+    assert "AUTHORIZED IN-SCOPE" not in out
+
+
+def test_cmd_check_allows_submission_eligible_asset(tmp_path, monkeypatch, capsys):
+    conn = _temp_db(tmp_path / "t.db")
+    pid = _seed_program(conn, "hackerone", "Acme", "acme")
+    _add_asset(conn, pid, "api.acme.com", eligible_for_submission=1)
+    out = _run_check(tmp_path, monkeypatch, capsys, conn, "api.acme.com")
+    assert "AUTHORIZED IN-SCOPE" in out
+
+
+def _run_export(tmp_path, monkeypatch, capsys, conn, program_ids, **argkw):
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(scan4me, "DB_PATH", str(tmp_path / "t.db"))
+    monkeypatch.setattr(scan4me, "evaluate_targets", lambda config=None: [{"id": i} for i in program_ids])
+    args = types.SimpleNamespace(top=30, wildcards_only=False, clean=False)
+    for k, v in argkw.items():
+        setattr(args, k, v)
+    scan4me.cmd_export(args, {})
+    return [ln.strip() for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+
+
+def test_cmd_export_excludes_submission_ineligible(tmp_path, monkeypatch, capsys):
+    conn = _temp_db(tmp_path / "t.db")
+    pid = _seed_program(conn, "hackerone", "Acme", "acme")
+    _add_asset(conn, pid, "ok.acme.com", eligible_for_submission=1)
+    _add_asset(conn, pid, "no.acme.com", eligible_for_submission=0)
+    out = _run_export(tmp_path, monkeypatch, capsys, conn, [pid])
+    assert "ok.acme.com" in out
+    assert "no.acme.com" not in out
+
+
+def test_cmd_export_paid_program_requires_bounty_eligibility(tmp_path, monkeypatch, capsys):
+    conn = _temp_db(tmp_path / "t.db")
+    pid = _seed_program(conn, "hackerone", "Paid", "paid", offers_bounties=1)
+    _add_asset(conn, pid, "paid-ok.com", eligible_for_bounty=1)
+    _add_asset(conn, pid, "paid-nobounty.com", eligible_for_bounty=0)
+    out = _run_export(tmp_path, monkeypatch, capsys, conn, [pid])
+    assert "paid-ok.com" in out
+    assert "paid-nobounty.com" not in out  # bounty-ineligible excluded from paid list
+
+
+def test_cmd_export_vdp_program_keeps_bounty_ineligible(tmp_path, monkeypatch, capsys):
+    conn = _temp_db(tmp_path / "t.db")
+    pid = _seed_program(conn, "hackerone", "Vdp", "vdp", offers_bounties=0)
+    _add_asset(conn, pid, "vdp-asset.com", eligible_for_bounty=0, eligible_for_submission=1)
+    out = _run_export(tmp_path, monkeypatch, capsys, conn, [pid])
+    assert "vdp-asset.com" in out  # VDP needs only submission eligibility

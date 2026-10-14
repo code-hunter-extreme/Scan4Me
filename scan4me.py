@@ -3147,13 +3147,15 @@ def cmd_check(args):
     target = (args.domain or "").strip().lower()
     cur = conn.cursor()
 
+    # Only submission-eligible assets can be authorized targets: an asset the
+    # program will not accept reports on must not print as [AUTHORIZED IN-SCOPE].
     candidates = cur.execute(
         """
         SELECT p.id AS program_id, p.platform, p.name, p.url, p.website,
                p.offers_bounties, a.asset_identifier, a.is_wildcard
         FROM assets a
         JOIN programs p ON a.program_id = p.id
-        WHERE a.deleted_timestamp=0
+        WHERE a.deleted_timestamp=0 AND a.eligible_for_submission=1
     """
     ).fetchall()
     in_scope = [
@@ -3225,12 +3227,18 @@ def cmd_export(args, config):
     if not target_ids:
         return
     placeholders = ",".join("?" * len(target_ids))
+    # Export only submission-eligible assets; for paid programs also require
+    # bounty eligibility, so a bounty-ineligible asset never enters the paid
+    # target list. VDP (offers_bounties=0) programs need only submission.
     sql = (
-        "SELECT DISTINCT asset_identifier FROM assets WHERE deleted_timestamp=0"  # nosec B608
-        " AND program_id IN (" + placeholders + ")"
+        "SELECT DISTINCT a.asset_identifier FROM assets a"  # nosec B608
+        " JOIN programs p ON a.program_id = p.id"
+        " WHERE a.deleted_timestamp=0 AND a.eligible_for_submission=1"
+        " AND (p.offers_bounties=0 OR a.eligible_for_bounty=1)"
+        " AND a.program_id IN (" + placeholders + ")"
     )
     if args.wildcards_only:
-        sql += " AND is_wildcard = 1"
+        sql += " AND a.is_wildcard = 1"
 
     rows = cur.execute(sql, target_ids).fetchall()
     for r in rows:
