@@ -1647,8 +1647,11 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
     h1_creds = creds.get("hackerone", {})
     h1_username = h1_creds.get("username")
     h1_token = h1_creds.get("api_token")
+    # `refresh` gates every network call: an offline run (refresh=False) must
+    # use cached feed data only and never hit an authenticated API, matching the
+    # immunefi/sherlock/pd_programs `*_attempted` flags below.
     h1_auth_used = bool(
-        h1_username and h1_token and platforms_cfg.get("hackerone", True)
+        refresh and h1_username and h1_token and platforms_cfg.get("hackerone", True)
     )
     if h1_auth_used:
         print(
@@ -1746,7 +1749,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
 
     # 2. Bugcrowd — authenticated API when key present, public feed fallback
     bc_token = creds.get("bugcrowd", {}).get("api_token")
-    bc_auth_used = bool(bc_token and platforms_cfg.get("bugcrowd", True))
+    bc_auth_used = bool(refresh and bc_token and platforms_cfg.get("bugcrowd", True))
     if bc_auth_used:
         print(
             "[*] Bugcrowd: API key found — using authenticated feed (includes private programs)."
@@ -1831,7 +1834,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
 
     # 3. Intigriti — authenticated API when key present, public feed fallback
     inti_token = creds.get("intigriti", {}).get("api_token")
-    inti_auth_used = bool(inti_token and platforms_cfg.get("intigriti", True))
+    inti_auth_used = bool(refresh and inti_token and platforms_cfg.get("intigriti", True))
     if inti_auth_used:
         print(
             "[*] Intigriti: API key found — using authenticated feed (includes private programs)."
@@ -1916,7 +1919,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
 
     # 4. YesWeHack — authenticated API when key present, public feed fallback
     ywh_token = creds.get("yeswehack", {}).get("api_token")
-    ywh_auth_used = bool(ywh_token and platforms_cfg.get("yeswehack", True))
+    ywh_auth_used = bool(refresh and ywh_token and platforms_cfg.get("yeswehack", True))
     if ywh_auth_used:
         print(
             "[*] YesWeHack: API key found — using authenticated feed (includes private programs)."
@@ -2933,6 +2936,12 @@ def feed_provenance(conn=None):
 
 
 def cmd_filter(args, config):
+    # Migrate the DB before ranking: evaluate_targets references migrated
+    # columns and does not call ensure_schema itself (query-count contract),
+    # so an older DB would raise mid-ranking without this.
+    _schema_conn = get_db()
+    ensure_schema(_schema_conn)
+    _schema_conn.close()
     results = evaluate_targets(config)
     limit = args.limit or config.get("display", {}).get("limit", 20)
     fresh_cfg = config.get("filters", {}).get("freshness_and_competition", {})
@@ -3217,12 +3226,14 @@ def cmd_check(args):
 
 
 def cmd_export(args, config):
+    # Migrate before ranking (see cmd_filter): evaluate_targets hits migrated
+    # columns, so ensure_schema must run first on an older DB.
+    conn = get_db()
+    ensure_schema(conn)
     results = evaluate_targets(config)
     limit = args.top or 30
     target_ids = [p["id"] for p in results[:limit]]
 
-    conn = get_db()
-    ensure_schema(conn)
     cur = conn.cursor()
     if not target_ids:
         return

@@ -1949,3 +1949,74 @@ def test_cmd_export_vdp_program_keeps_bounty_ineligible(tmp_path, monkeypatch, c
     _add_asset(conn, pid, "vdp-asset.com", eligible_for_bounty=0, eligible_for_submission=1)
     out = _run_export(tmp_path, monkeypatch, capsys, conn, [pid])
     assert "vdp-asset.com" in out  # VDP needs only submission eligibility
+
+
+# ── offline must not hit authenticated APIs (Greptile issue 6) ────────────────
+
+
+def test_sync_offline_does_not_call_authenticated_apis(tmp_path, monkeypatch):
+    """With refresh=False, configured credentials must NOT trigger network calls."""
+    monkeypatch.setattr(scan4me, "CACHE_DATA_DIR", tmp_path / "cache")
+    monkeypatch.setattr(scan4me, "DB_PATH", tmp_path / "t.db")
+    data_dir = tmp_path / "cache" / "data"
+    data_dir.mkdir(parents=True)
+    for feed in ("hackerone_data.json", "bugcrowd_data.json",
+                 "intigriti_data.json", "yeswehack_data.json"):
+        (data_dir / feed).write_text("[]", encoding="utf-8")
+    # Credentials present for all four authenticated platforms.
+    monkeypatch.setattr(scan4me, "load_credentials", lambda config=None: {
+        "hackerone": {"username": "u", "api_token": "t"},
+        "bugcrowd": {"api_token": "t"},
+        "intigriti": {"api_token": "t"},
+        "yeswehack": {"api_token": "t"},
+    })
+    # Any authenticated fetch is a failure when offline.
+    for fn in ("_fetch_h1_authenticated", "_fetch_bugcrowd_authenticated",
+               "_fetch_intigriti_authenticated", "_fetch_yeswehack_authenticated"):
+        monkeypatch.setattr(scan4me, fn, lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("offline run made an authenticated network call")))
+    cfg = {"hackerone": True, "bugcrowd": True, "intigriti": True, "yeswehack": True,
+           "federacy": False, "immunefi": False, "sherlock": False, "pd_programs": False}
+    # Must complete without calling any authenticated fetcher.
+    scan4me.sync_data(refresh=False, platforms_cfg=cfg, config={})
+
+
+# ── schema migrated before ranking (Greptile issue 8) ─────────────────────────
+
+
+def _record_schema_then_eval(monkeypatch):
+    calls = []
+
+    class _DummyConn:
+        def cursor(self):
+            class _C:
+                def execute(self, *a, **k):
+                    return self
+                def fetchall(self):
+                    return []
+            return _C()
+        def close(self):
+            pass
+
+    monkeypatch.setattr(scan4me, "get_db", lambda: _DummyConn())
+    monkeypatch.setattr(scan4me, "ensure_schema", lambda conn: calls.append("schema"))
+    monkeypatch.setattr(scan4me, "evaluate_targets", lambda config=None: calls.append("eval") or [])
+    import collections as _c
+    monkeypatch.setattr(scan4me, "feed_provenance", lambda *a, **k: {
+        "upstream_sha": "x", "age_hours": 1.0, "stale": False,
+        "row_counts": _c.defaultdict(int), "coverage_gaps": [], "platforms": {},
+    })
+    return calls
+
+
+def test_cmd_filter_migrates_before_ranking(tmp_path, monkeypatch, capsys):
+    calls = _record_schema_then_eval(monkeypatch)
+    scan4me.cmd_filter(types.SimpleNamespace(limit=20), {"display": {"limit": 20}})
+    assert calls and calls[0] == "schema", calls
+    assert "eval" in calls and calls.index("schema") < calls.index("eval")
+
+
+def test_cmd_export_migrates_before_ranking(tmp_path, monkeypatch, capsys):
+    calls = _record_schema_then_eval(monkeypatch)
+    scan4me.cmd_export(types.SimpleNamespace(top=30, wildcards_only=False, clean=False), {})
+    assert calls == ["schema", "eval"], calls
