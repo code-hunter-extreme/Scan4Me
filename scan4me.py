@@ -1540,6 +1540,37 @@ def _platform_status(enabled, data, source, auth_used=False):
     return {"status": "ok", "count": len(data), "source": source}
 
 
+def _tombstone_withdrawn_programs(cur, platform, seen_handles, now_ts):
+    """Tombstone the live assets of ``platform`` programs absent from a feed.
+
+    When a program disappears from a complete, successful fetch it has closed
+    or withdrawn its scope; its still-live assets must stop being treated as
+    authorized (checks/exports/ranking all filter on ``deleted_timestamp=0``).
+    The caller must invoke this ONLY after a complete successful fetch — never
+    on a failed, partial, or empty one — so a transient outage cannot wipe
+    scope. Returns the number of programs tombstoned.
+    """
+    withdrawn = [
+        row["id"]
+        for row in cur.execute(
+            "SELECT id, handle FROM programs WHERE platform=?", (platform,)
+        ).fetchall()
+        if (row["handle"] or "") not in seen_handles
+    ]
+    for pid in withdrawn:
+        cur.execute(
+            "UPDATE assets SET deleted_timestamp=? "
+            "WHERE program_id=? AND deleted_timestamp=0",
+            (now_ts, pid),
+        )
+        cur.execute(
+            "UPDATE oos_assets SET deleted_timestamp=? "
+            "WHERE program_id=? AND deleted_timestamp=0",
+            (now_ts, pid),
+        )
+    return len(withdrawn)
+
+
 def sync_data(refresh=True, platforms_cfg=None, config=None):
     """Sync all enabled feed sources into the local SQLite database.
 
@@ -1749,6 +1780,13 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     now_ts,
                     stats=ingest_stats.setdefault("hackerone", {}),
                 )
+        # Withdrawn-program reconciliation: only after a complete
+        # successful fetch (refresh and refresh_ok). Programs absent from
+        # this full feed have closed/withdrawn scope -> tombstone their assets.
+        if refresh and refresh_ok:
+            _seen = {row.get("handle") for row in h1_data if row.get("handle")}
+            with conn:
+                _tombstone_withdrawn_programs(cur, "HackerOne", _seen, now_ts)
         print(f"[+] HackerOne indexed: {len(h1_data)} programs.")
     platform_status["hackerone"] = _platform_status(
         platforms_cfg.get("hackerone", True), h1_data, h1_source, h1_auth_used
@@ -1834,6 +1872,13 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     now_ts,
                     stats=ingest_stats.setdefault("bugcrowd", {}),
                 )
+        # Withdrawn-program reconciliation: only after a complete
+        # successful fetch (refresh and refresh_ok). Programs absent from
+        # this full feed have closed/withdrawn scope -> tombstone their assets.
+        if refresh and refresh_ok:
+            _seen = {row.get("handle") for row in bc_data if row.get("handle")}
+            with conn:
+                _tombstone_withdrawn_programs(cur, "Bugcrowd", _seen, now_ts)
         print(f"[+] Bugcrowd indexed: {len(bc_data)} programs.")
     platform_status["bugcrowd"] = _platform_status(
         platforms_cfg.get("bugcrowd", True), bc_data, bc_source, bc_auth_used
@@ -1919,6 +1964,13 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     now_ts,
                     stats=ingest_stats.setdefault("intigriti", {}),
                 )
+        # Withdrawn-program reconciliation: only after a complete
+        # successful fetch (refresh and refresh_ok). Programs absent from
+        # this full feed have closed/withdrawn scope -> tombstone their assets.
+        if refresh and refresh_ok:
+            _seen = {row.get("handle") for row in inti_data if row.get("handle")}
+            with conn:
+                _tombstone_withdrawn_programs(cur, "Intigriti", _seen, now_ts)
         print(f"[+] Intigriti indexed: {len(inti_data)} programs.")
     platform_status["intigriti"] = _platform_status(
         platforms_cfg.get("intigriti", True), inti_data, inti_source, inti_auth_used
@@ -1998,6 +2050,13 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     now_ts,
                     stats=ingest_stats.setdefault("yeswehack", {}),
                 )
+        # Withdrawn-program reconciliation: only after a complete
+        # successful fetch (refresh and refresh_ok). Programs absent from
+        # this full feed have closed/withdrawn scope -> tombstone their assets.
+        if refresh and refresh_ok:
+            _seen = {row.get("handle") for row in ywh_data if row.get("handle")}
+            with conn:
+                _tombstone_withdrawn_programs(cur, "YesWeHack", _seen, now_ts)
         print(f"[+] YesWeHack indexed: {len(ywh_data)} programs.")
     platform_status["yeswehack"] = _platform_status(
         platforms_cfg.get("yeswehack", True), ywh_data, ywh_source, ywh_auth_used
