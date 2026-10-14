@@ -2463,6 +2463,7 @@ def evaluate_targets(config=None):
         "SELECT p.*, count(a.id) as asset_count, sum(a.is_wildcard) as wildcard_count "  # nosec B608
         "FROM programs p "
         "LEFT JOIN assets a ON p.id = a.program_id "
+        "AND a.deleted_timestamp=0 "
         "WHERE p.platform IN (" + plat_holders + ")"
     )
     params = list(target_plats)
@@ -3102,6 +3103,30 @@ def scope_match(target, asset_identifier, is_wildcard):
     return False
 
 
+def _ip_matches_rule(target, rule_identifier) -> bool:
+    """True when ``target`` is an IP address contained in ``rule_identifier``.
+
+    ``rule_identifier`` may be a CIDR ('10.0.0.0/8') or a bare IP ('10.1.2.3').
+    Used for out-of-scope exclusions: ``scope_match`` compares hosts as strings,
+    so a CIDR exclusion would never catch an individual address inside it and
+    that address would be wrongly reported as authorized. Returns False for any
+    non-IP target or unparseable rule — it only ever adds an exclusion, never
+    removes one.
+    """
+    try:
+        ip = ipaddress.ip_address((target or "").strip())
+    except ValueError:
+        return False
+    rule = (rule_identifier or "").strip()
+    try:
+        return ip in ipaddress.ip_network(rule, strict=False)
+    except ValueError:
+        try:
+            return ip == ipaddress.ip_address(rule)
+        except ValueError:
+            return False
+
+
 def clean_asset_identifier(value):
     """Bare host for recon-tool piping: no scheme, path, port, or star."""
     host, _, _, ok = canonicalize_asset(value, "url")
@@ -3122,20 +3147,54 @@ def cmd_check(args):
     target = (args.domain or "").strip().lower()
     cur = conn.cursor()
 
+    # Only submission-eligible assets can be authorized targets: an asset the
+    # program will not accept reports on must not print as [AUTHORIZED IN-SCOPE].
     candidates = cur.execute(
         """
-        SELECT p.platform, p.name, p.url, p.website, p.offers_bounties,
-               a.asset_identifier, a.is_wildcard
+        SELECT p.id AS program_id, p.platform, p.name, p.url, p.website,
+               p.offers_bounties, a.asset_identifier, a.is_wildcard
         FROM assets a
         JOIN programs p ON a.program_id = p.id
-        WHERE a.deleted_timestamp=0
+        WHERE a.deleted_timestamp=0 AND a.eligible_for_submission=1
     """
     ).fetchall()
-    matches = [
+    in_scope = [
         m
         for m in candidates
         if scope_match(target, m["asset_identifier"], m["is_wildcard"])
-    ][:10]
+    ]
+
+    # Live out-of-scope exclusions win over an in-scope wildcard: a target that
+    # matches an explicit oos_assets rule for the same program is NOT authorized.
+    # Cache the verdict per program_id — several in-scope assets can belong to
+    # one program, and the exclusion set is identical for all of them.
+    oos_cache = {}
+
+    def _is_oos(program_id) -> bool:
+        if program_id in oos_cache:
+            return oos_cache[program_id]
+        verdict = False
+        for row in cur.execute(
+            "SELECT asset_identifier, is_wildcard FROM oos_assets "
+            "WHERE program_id=? AND deleted_timestamp=0",
+            (program_id,),
+        ).fetchall():
+            if scope_match(target, row["asset_identifier"], row["is_wildcard"]) or (
+                _ip_matches_rule(target, row["asset_identifier"])
+            ):
+                verdict = True
+                break
+        oos_cache[program_id] = verdict
+        return verdict
+
+    # Keep the first ten authorized matches; stop scanning once we have them.
+    matches = []
+    for m in in_scope:
+        if _is_oos(m["program_id"]):
+            continue
+        matches.append(m)
+        if len(matches) >= 10:
+            break
 
     if matches:
         print(
@@ -3168,12 +3227,18 @@ def cmd_export(args, config):
     if not target_ids:
         return
     placeholders = ",".join("?" * len(target_ids))
+    # Export only submission-eligible assets; for paid programs also require
+    # bounty eligibility, so a bounty-ineligible asset never enters the paid
+    # target list. VDP (offers_bounties=0) programs need only submission.
     sql = (
-        "SELECT DISTINCT asset_identifier FROM assets WHERE deleted_timestamp=0"  # nosec B608
-        " AND program_id IN (" + placeholders + ")"
+        "SELECT DISTINCT a.asset_identifier FROM assets a"  # nosec B608
+        " JOIN programs p ON a.program_id = p.id"
+        " WHERE a.deleted_timestamp=0 AND a.eligible_for_submission=1"
+        " AND (p.offers_bounties=0 OR a.eligible_for_bounty=1)"
+        " AND a.program_id IN (" + placeholders + ")"
     )
     if args.wildcards_only:
-        sql += " AND is_wildcard = 1"
+        sql += " AND a.is_wildcard = 1"
 
     rows = cur.execute(sql, target_ids).fetchall()
     for r in rows:
