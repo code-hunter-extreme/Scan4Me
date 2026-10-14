@@ -1954,8 +1954,9 @@ def test_cmd_export_vdp_program_keeps_bounty_ineligible(tmp_path, monkeypatch, c
 # ── offline must not hit authenticated APIs (Greptile issue 6) ────────────────
 
 
-def test_sync_offline_does_not_call_authenticated_apis(tmp_path, monkeypatch):
-    """With refresh=False, configured credentials must NOT trigger network calls."""
+def test_sync_offline_does_not_call_authenticated_apis(tmp_path, monkeypatch, capsys):
+    """With refresh=False, configured credentials must NOT trigger network calls,
+    and complete credentials must NOT be mislabeled as 'partial'."""
     monkeypatch.setattr(scan4me, "CACHE_DATA_DIR", tmp_path / "cache")
     monkeypatch.setattr(scan4me, "DB_PATH", tmp_path / "t.db")
     data_dir = tmp_path / "cache" / "data"
@@ -1979,6 +1980,10 @@ def test_sync_offline_does_not_call_authenticated_apis(tmp_path, monkeypatch):
            "federacy": False, "immunefi": False, "sherlock": False, "pd_programs": False}
     # Must complete without calling any authenticated fetcher.
     scan4me.sync_data(refresh=False, platforms_cfg=cfg, config={})
+    out = capsys.readouterr().out
+    # Complete credentials skipped for being offline must NOT be called "partial".
+    assert "partial credentials" not in out
+    assert "offline mode" in out
 
 
 # ── schema migrated before ranking (Greptile issue 8) ─────────────────────────

@@ -1660,9 +1660,16 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
         h1_data = _fetch_h1_authenticated(h1_username, h1_token)
         h1_source = "authenticated"
     else:
-        if h1_username or h1_token:
+        if bool(h1_username) != bool(h1_token):
+            # Exactly one of username/token supplied — genuinely incomplete.
             print(
                 "[!] HackerOne: partial credentials (need both username + api_token) — using public feed."
+            )
+        elif h1_username and h1_token and not refresh:
+            # Complete credentials, skipped only because this is an offline run —
+            # not a credential problem; don't send the user chasing one.
+            print(
+                "[*] HackerOne: offline mode — authenticated fetch skipped, using cached public feed."
             )
         h1_file = local_data_dir / "hackerone_data.json"
         if h1_file.exists():
