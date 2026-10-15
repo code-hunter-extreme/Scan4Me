@@ -160,6 +160,30 @@ def _api_request(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _h1_in_scope(structured_scopes):
+    """Submission-eligible HackerOne scopes, preserving the eligibility and
+    restriction fields (#15). Dropping eligible_for_bounty/instruction/
+    max_severity here makes _eligibility_of default them to eligible, so a
+    submit-but-no-bounty asset would wrongly enter the paid target list and
+    its restrictions would vanish. Keep them alongside identifier + type.
+    """
+    out = []
+    for s in structured_scopes or []:
+        if not s.get("eligible_for_submission"):
+            continue
+        out.append(
+            {
+                "asset_identifier": s.get("asset_identifier", ""),
+                "asset_type": s.get("asset_type", "URL"),
+                "eligible_for_bounty": s.get("eligible_for_bounty", True),
+                "eligible_for_submission": s.get("eligible_for_submission", True),
+                "instruction": s.get("instruction") or "",
+                "max_severity": s.get("max_severity") or "",
+            }
+        )
+    return out
+
+
 def _fetch_h1_authenticated(username, api_token):
     """Fetch your full HackerOne program list via the authenticated API.
 
@@ -207,14 +231,7 @@ def _fetch_h1_authenticated(username, api_token):
                         "response_efficiency_percentage"
                     ),
                     "targets": {
-                        "in_scope": [
-                            {
-                                "asset_identifier": s.get("asset_identifier", ""),
-                                "asset_type": s.get("asset_type", "URL"),
-                            }
-                            for s in attrs.get("structured_scopes", [])
-                            if s.get("eligible_for_submission")
-                        ]
+                        "in_scope": _h1_in_scope(attrs.get("structured_scopes", []))
                     },
                 }
             )
@@ -2351,6 +2368,10 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
     _set_meta(cur, "upstream_sha", upstream_sha)
     _set_meta(cur, "last_sync_ts", str(now_ts))
     _set_meta(cur, "last_refresh_ok", "1" if refresh_ok else "0")
+    # Feed-age anchor: only a real, successful network refresh counts. Offline
+    # imports (refresh=False) and failed fetches must not reset feed age (#9).
+    if refresh and refresh_ok:
+        _set_meta(cur, "last_successful_sync_ts", str(now_ts))
     if refresh_error:
         _set_meta(cur, "last_refresh_error", refresh_error)
     _set_meta(cur, "platform_status", json.dumps(platform_status, sort_keys=True))
@@ -2956,11 +2977,22 @@ def feed_provenance(conn=None):
             conn.close()
 
     now_ts = int(time.time())
-    try:
-        sync_ts = int(meta.get("last_sync_ts", 0) or 0)
-    except (TypeError, ValueError):
-        sync_ts = 0
-    age_hours = round((now_ts - sync_ts) / 3600.0, 1) if sync_ts else None
+
+    def _meta_int(key: str) -> int:
+        try:
+            return int(meta.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    sync_ts = _meta_int("last_sync_ts")
+    # Feed age is measured from the last SUCCESSFUL network refresh, never from
+    # the last time sync_data merely ran: an offline import or a failed fetch
+    # stamps last_sync_ts=now but must not make a stale snapshot look fresh (#9).
+    succ_ts = _meta_int("last_successful_sync_ts")
+    if not succ_ts and meta.get("last_refresh_ok") != "0":
+        # Pre-fix DB whose last run did not fail: fall back to last_sync_ts.
+        succ_ts = sync_ts
+    age_hours = round((now_ts - succ_ts) / 3600.0, 1) if succ_ts else None
 
     gaps = [
         # Structural: no feed carries rules/policy text, so Oracle's verify
@@ -2988,6 +3020,7 @@ def feed_provenance(conn=None):
     return {
         "upstream_sha": meta.get("upstream_sha") or "unknown",
         "last_sync_ts": sync_ts or None,
+        "last_successful_sync_ts": succ_ts or None,
         "age_hours": age_hours,
         "stale": age_hours is not None and age_hours > STALE_AFTER_HOURS,
         "refresh_ok": meta.get("last_refresh_ok") != "0",

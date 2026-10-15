@@ -1317,9 +1317,17 @@ def test_p5_h1_authenticated_pagination_and_auth(monkeypatch):
     assert calls[0][0].startswith(f"{scan4me.H1_API_BASE}/hackers/programs")
     assert programs[0]["handle"] == "acme"
     assert programs[0]["url"] == "https://hackerone.com/acme"
-    # Only eligible scopes become targets.
+    # Only eligible scopes become targets, and eligibility/restriction fields
+    # are preserved (defaults when the feed omits them) — not dropped (#15).
     assert programs[0]["targets"]["in_scope"] == [
-        {"asset_identifier": "acme.com", "asset_type": "URL"}
+        {
+            "asset_identifier": "acme.com",
+            "asset_type": "URL",
+            "eligible_for_bounty": True,
+            "eligible_for_submission": True,
+            "instruction": "",
+            "max_severity": "",
+        }
     ]
     assert programs[1]["handle"] == "beta"
 
@@ -2073,3 +2081,48 @@ def test_tombstone_withdrawn_is_idempotent(tmp_path):
     ts2 = conn.execute("SELECT deleted_timestamp FROM assets WHERE program_id=?", (gone,)).fetchone()[0]
     assert ts1 == 1000 and ts2 == 1000  # only live (deleted_timestamp=0) rows are stamped
     conn.close()
+
+
+def test_feed_age_uses_last_successful_refresh_not_last_run(tmp_path):
+    """A failed/offline sync stamps last_sync_ts=now but must NOT make a stale
+    snapshot look fresh — age is measured from the last successful refresh (#9)."""
+    conn = _temp_db(tmp_path / "t.db")
+    old = int(time.time()) - 100 * 3600          # last good refresh: 100h ago
+    cur = conn.cursor()
+    cur.executemany(
+        "INSERT INTO sync_metadata(key, value) VALUES(?, ?)",
+        [
+            ("last_successful_sync_ts", str(old)),
+            ("last_sync_ts", str(int(time.time()))),  # a just-now failed/offline run
+            ("last_refresh_ok", "0"),
+        ],
+    )
+    conn.commit()
+    prov = scan4me.feed_provenance(conn)
+    conn.close()
+    assert prov["age_hours"] == 100.0          # from the successful refresh, not ~0
+    assert prov["stale"] is True
+    assert prov["refresh_ok"] is False
+
+
+def test_h1_in_scope_preserves_eligibility_and_restrictions():
+    """HackerOne fetch must keep eligible_for_bounty/instruction/max_severity
+    (and filter to submission-eligible) so no-bounty assets aren't defaulted
+    to bounty-eligible and restrictions aren't lost (#15)."""
+    scopes = [
+        {"asset_identifier": "a.com", "asset_type": "URL",
+         "eligible_for_submission": True, "eligible_for_bounty": False,
+         "instruction": "staging only", "max_severity": "medium"},
+        {"asset_identifier": "b.com", "asset_type": "URL",
+         "eligible_for_submission": False, "eligible_for_bounty": True},
+    ]
+    out = scan4me._h1_in_scope(scopes)
+    assert len(out) == 1  # submission-ineligible b.com dropped
+    a = out[0]
+    assert a["asset_identifier"] == "a.com"
+    assert a["eligible_for_bounty"] is False   # preserved, not defaulted to True
+    assert a["instruction"] == "staging only"
+    assert a["max_severity"] == "medium"
+    # and _eligibility_of now reads the real values
+    bounty, submission, instruction, severity = scan4me._eligibility_of(a)
+    assert bounty == 0 and submission == 1 and instruction == "staging only"
