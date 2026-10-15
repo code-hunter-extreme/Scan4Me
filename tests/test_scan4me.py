@@ -1317,9 +1317,17 @@ def test_p5_h1_authenticated_pagination_and_auth(monkeypatch):
     assert calls[0][0].startswith(f"{scan4me.H1_API_BASE}/hackers/programs")
     assert programs[0]["handle"] == "acme"
     assert programs[0]["url"] == "https://hackerone.com/acme"
-    # Only eligible scopes become targets.
+    # Only eligible scopes become targets, and eligibility/restriction fields
+    # are preserved (defaults when the feed omits them) — not dropped (#15).
     assert programs[0]["targets"]["in_scope"] == [
-        {"asset_identifier": "acme.com", "asset_type": "URL"}
+        {
+            "asset_identifier": "acme.com",
+            "asset_type": "URL",
+            "eligible_for_bounty": True,
+            "eligible_for_submission": True,
+            "instruction": "",
+            "max_severity": "",
+        }
     ]
     assert programs[1]["handle"] == "beta"
 
@@ -1949,3 +1957,179 @@ def test_cmd_export_vdp_program_keeps_bounty_ineligible(tmp_path, monkeypatch, c
     _add_asset(conn, pid, "vdp-asset.com", eligible_for_bounty=0, eligible_for_submission=1)
     out = _run_export(tmp_path, monkeypatch, capsys, conn, [pid])
     assert "vdp-asset.com" in out  # VDP needs only submission eligibility
+
+
+# ── offline must not hit authenticated APIs (Greptile issue 6) ────────────────
+
+
+def test_sync_offline_does_not_call_authenticated_apis(tmp_path, monkeypatch, capsys):
+    """With refresh=False, configured credentials must NOT trigger network calls,
+    and complete credentials must NOT be mislabeled as 'partial'."""
+    monkeypatch.setattr(scan4me, "CACHE_DATA_DIR", tmp_path / "cache")
+    monkeypatch.setattr(scan4me, "DB_PATH", tmp_path / "t.db")
+    data_dir = tmp_path / "cache" / "data"
+    data_dir.mkdir(parents=True)
+    for feed in ("hackerone_data.json", "bugcrowd_data.json",
+                 "intigriti_data.json", "yeswehack_data.json"):
+        (data_dir / feed).write_text("[]", encoding="utf-8")
+    # Credentials present for all four authenticated platforms.
+    monkeypatch.setattr(scan4me, "load_credentials", lambda config=None: {
+        "hackerone": {"username": "u", "api_token": "t"},
+        "bugcrowd": {"api_token": "t"},
+        "intigriti": {"api_token": "t"},
+        "yeswehack": {"api_token": "t"},
+    })
+    # Any authenticated fetch is a failure when offline.
+    for fn in ("_fetch_h1_authenticated", "_fetch_bugcrowd_authenticated",
+               "_fetch_intigriti_authenticated", "_fetch_yeswehack_authenticated"):
+        monkeypatch.setattr(scan4me, fn, lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("offline run made an authenticated network call")))
+    cfg = {"hackerone": True, "bugcrowd": True, "intigriti": True, "yeswehack": True,
+           "federacy": False, "immunefi": False, "sherlock": False, "pd_programs": False}
+    # Must complete without calling any authenticated fetcher.
+    scan4me.sync_data(refresh=False, platforms_cfg=cfg, config={})
+    out = capsys.readouterr().out
+    # Complete credentials skipped for being offline must NOT be called "partial".
+    assert "partial credentials" not in out
+    assert "offline mode" in out
+
+
+# ── schema migrated before ranking (Greptile issue 8) ─────────────────────────
+
+
+def _record_schema_then_eval(monkeypatch):
+    calls = []
+
+    class _DummyConn:
+        def cursor(self):
+            class _C:
+                def execute(self, *a, **k):
+                    return self
+                def fetchall(self):
+                    return []
+            return _C()
+        def close(self):
+            pass
+
+    monkeypatch.setattr(scan4me, "get_db", lambda: _DummyConn())
+    monkeypatch.setattr(scan4me, "ensure_schema", lambda conn: calls.append("schema"))
+    monkeypatch.setattr(scan4me, "evaluate_targets", lambda config=None: calls.append("eval") or [])
+    import collections as _c
+    monkeypatch.setattr(scan4me, "feed_provenance", lambda *a, **k: {
+        "upstream_sha": "x", "age_hours": 1.0, "stale": False,
+        "row_counts": _c.defaultdict(int), "coverage_gaps": [], "platforms": {},
+    })
+    return calls
+
+
+def test_cmd_filter_migrates_before_ranking(tmp_path, monkeypatch, capsys):
+    calls = _record_schema_then_eval(monkeypatch)
+    scan4me.cmd_filter(types.SimpleNamespace(limit=20), {"display": {"limit": 20}})
+    assert calls and calls[0] == "schema", calls
+    assert "eval" in calls and calls.index("schema") < calls.index("eval")
+
+
+def test_cmd_export_migrates_before_ranking(tmp_path, monkeypatch, capsys):
+    calls = _record_schema_then_eval(monkeypatch)
+    scan4me.cmd_export(types.SimpleNamespace(top=30, wildcards_only=False, clean=False), {})
+    assert calls == ["schema", "eval"], calls
+
+
+# ── withdrawn-program reconciliation (Greptile issue 4) ───────────────────────
+
+
+
+
+
+
+def test_feed_age_uses_last_successful_refresh_not_last_run(tmp_path):
+    """A failed/offline sync stamps last_sync_ts=now but must NOT make a stale
+    snapshot look fresh — age is measured from the last successful refresh (#9)."""
+    conn = _temp_db(tmp_path / "t.db")
+    old = int(time.time()) - 100 * 3600          # last good refresh: 100h ago
+    cur = conn.cursor()
+    cur.executemany(
+        "INSERT INTO sync_metadata(key, value) VALUES(?, ?)",
+        [
+            ("last_successful_sync_ts", str(old)),
+            ("last_sync_ts", str(int(time.time()))),  # a just-now failed/offline run
+            ("last_refresh_ok", "0"),
+        ],
+    )
+    conn.commit()
+    prov = scan4me.feed_provenance(conn)
+    conn.close()
+    assert prov["age_hours"] == 100.0          # from the successful refresh, not ~0
+    assert prov["stale"] is True
+    assert prov["refresh_ok"] is False
+
+
+def test_h1_in_scope_preserves_eligibility_and_restrictions():
+    """HackerOne fetch must keep eligible_for_bounty/instruction/max_severity
+    (and filter to submission-eligible) so no-bounty assets aren't defaulted
+    to bounty-eligible and restrictions aren't lost (#15)."""
+    scopes = [
+        {"asset_identifier": "a.com", "asset_type": "URL",
+         "eligible_for_submission": True, "eligible_for_bounty": False,
+         "instruction": "staging only", "max_severity": "medium"},
+        {"asset_identifier": "b.com", "asset_type": "URL",
+         "eligible_for_submission": False, "eligible_for_bounty": True},
+    ]
+    out = scan4me._h1_in_scope(scopes)
+    assert len(out) == 1  # submission-ineligible b.com dropped
+    a = out[0]
+    assert a["asset_identifier"] == "a.com"
+    assert a["eligible_for_bounty"] is False   # preserved, not defaulted to True
+    assert a["instruction"] == "staging only"
+    assert a["max_severity"] == "medium"
+    # and _eligibility_of now reads the real values
+    bounty, submission, instruction, severity = scan4me._eligibility_of(a)
+    assert bounty == 0 and submission == 1 and instruction == "staging only"
+
+
+def test_strict_new_companies_requires_bugcrowd_official_date(tmp_path, monkeypatch):
+    """STRICT new-companies must require Bugcrowd + a recent OFFICIAL start date;
+    a non-Bugcrowd program fresh only by feed-observation date must NOT satisfy
+    the strict gate (#7). Without strict, both still appear (scoring signal)."""
+    db_path = tmp_path / "t.db"
+    conn = _temp_db(db_path)
+    cur = conn.cursor()
+    now = int(time.time())
+    recent = now - 10 * 86400
+    # A: Bugcrowd with a recent OFFICIAL start date → qualifies under strict.
+    cur.execute(
+        """INSERT INTO programs (platform, name, handle, offers_bounties, max_payout,
+           first_response_hours, response_efficiency, first_seen_timestamp,
+           official_start_timestamp)
+           VALUES ('Bugcrowd','BC New','bc-new',1,5000,5.0,95.0,?,?)""",
+        (now - 300 * 86400, recent),
+    )
+    cur.execute("INSERT INTO assets (program_id, asset_identifier, asset_type) "
+                "VALUES (?, 'a.bc.com', 'URL')", (cur.lastrowid,))
+    # B: HackerOne, fresh only by feed first-seen (observation), no official date.
+    cur.execute(
+        """INSERT INTO programs (platform, name, handle, offers_bounties, max_payout,
+           first_response_hours, response_efficiency, first_seen_timestamp)
+           VALUES ('HackerOne','H1 Obs','h1-obs',1,5000,5.0,95.0,?)""",
+        (recent,),
+    )
+    cur.execute("INSERT INTO assets (program_id, asset_identifier, asset_type) "
+                "VALUES (?, 'a.h1.com', 'URL')", (cur.lastrowid,))
+    conn.commit(); conn.close()
+
+    monkeypatch.setattr(scan4me, "DB_PATH", str(db_path))
+
+    cfg = _eval_config(bugcrowd=True, hackerone=True)
+    fresh = cfg["filters"].setdefault("freshness_and_competition", {})
+
+    # Not strict: observation newness is a scoring signal — both appear.
+    fresh.update({"prefer_new_companies": True, "strict_new_companies": False,
+                  "new_company_days": 90})
+    names = {p["name"] for p in scan4me.evaluate_targets(cfg)}
+    assert {"BC New", "H1 Obs"} <= names, names
+
+    # Strict: only the Bugcrowd program with an official date qualifies.
+    fresh["strict_new_companies"] = True
+    strict_names = {p["name"] for p in scan4me.evaluate_targets(cfg)}
+    assert "BC New" in strict_names
+    assert "H1 Obs" not in strict_names, strict_names

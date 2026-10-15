@@ -160,6 +160,30 @@ def _api_request(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _h1_in_scope(structured_scopes):
+    """Submission-eligible HackerOne scopes, preserving the eligibility and
+    restriction fields (#15). Dropping eligible_for_bounty/instruction/
+    max_severity here makes _eligibility_of default them to eligible, so a
+    submit-but-no-bounty asset would wrongly enter the paid target list and
+    its restrictions would vanish. Keep them alongside identifier + type.
+    """
+    out = []
+    for s in structured_scopes or []:
+        if not s.get("eligible_for_submission"):
+            continue
+        out.append(
+            {
+                "asset_identifier": s.get("asset_identifier", ""),
+                "asset_type": s.get("asset_type", "URL"),
+                "eligible_for_bounty": s.get("eligible_for_bounty", True),
+                "eligible_for_submission": s.get("eligible_for_submission", True),
+                "instruction": s.get("instruction") or "",
+                "max_severity": s.get("max_severity") or "",
+            }
+        )
+    return out
+
+
 def _fetch_h1_authenticated(username, api_token):
     """Fetch your full HackerOne program list via the authenticated API.
 
@@ -207,14 +231,7 @@ def _fetch_h1_authenticated(username, api_token):
                         "response_efficiency_percentage"
                     ),
                     "targets": {
-                        "in_scope": [
-                            {
-                                "asset_identifier": s.get("asset_identifier", ""),
-                                "asset_type": s.get("asset_type", "URL"),
-                            }
-                            for s in attrs.get("structured_scopes", [])
-                            if s.get("eligible_for_submission")
-                        ]
+                        "in_scope": _h1_in_scope(attrs.get("structured_scopes", []))
                     },
                 }
             )
@@ -1540,6 +1557,7 @@ def _platform_status(enabled, data, source, auth_used=False):
     return {"status": "ok", "count": len(data), "source": source}
 
 
+
 def sync_data(refresh=True, platforms_cfg=None, config=None):
     """Sync all enabled feed sources into the local SQLite database.
 
@@ -1647,8 +1665,11 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
     h1_creds = creds.get("hackerone", {})
     h1_username = h1_creds.get("username")
     h1_token = h1_creds.get("api_token")
+    # `refresh` gates every network call: an offline run (refresh=False) must
+    # use cached feed data only and never hit an authenticated API, matching the
+    # immunefi/sherlock/pd_programs `*_attempted` flags below.
     h1_auth_used = bool(
-        h1_username and h1_token and platforms_cfg.get("hackerone", True)
+        refresh and h1_username and h1_token and platforms_cfg.get("hackerone", True)
     )
     if h1_auth_used:
         print(
@@ -1657,9 +1678,16 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
         h1_data = _fetch_h1_authenticated(h1_username, h1_token)
         h1_source = "authenticated"
     else:
-        if h1_username or h1_token:
+        if bool(h1_username) != bool(h1_token):
+            # Exactly one of username/token supplied — genuinely incomplete.
             print(
                 "[!] HackerOne: partial credentials (need both username + api_token) — using public feed."
+            )
+        elif h1_username and h1_token and not refresh:
+            # Complete credentials, skipped only because this is an offline run —
+            # not a credential problem; don't send the user chasing one.
+            print(
+                "[*] HackerOne: offline mode — authenticated fetch skipped, using cached public feed."
             )
         h1_file = local_data_dir / "hackerone_data.json"
         if h1_file.exists():
@@ -1746,7 +1774,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
 
     # 2. Bugcrowd — authenticated API when key present, public feed fallback
     bc_token = creds.get("bugcrowd", {}).get("api_token")
-    bc_auth_used = bool(bc_token and platforms_cfg.get("bugcrowd", True))
+    bc_auth_used = bool(refresh and bc_token and platforms_cfg.get("bugcrowd", True))
     if bc_auth_used:
         print(
             "[*] Bugcrowd: API key found — using authenticated feed (includes private programs)."
@@ -1831,7 +1859,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
 
     # 3. Intigriti — authenticated API when key present, public feed fallback
     inti_token = creds.get("intigriti", {}).get("api_token")
-    inti_auth_used = bool(inti_token and platforms_cfg.get("intigriti", True))
+    inti_auth_used = bool(refresh and inti_token and platforms_cfg.get("intigriti", True))
     if inti_auth_used:
         print(
             "[*] Intigriti: API key found — using authenticated feed (includes private programs)."
@@ -1916,7 +1944,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
 
     # 4. YesWeHack — authenticated API when key present, public feed fallback
     ywh_token = creds.get("yeswehack", {}).get("api_token")
-    ywh_auth_used = bool(ywh_token and platforms_cfg.get("yeswehack", True))
+    ywh_auth_used = bool(refresh and ywh_token and platforms_cfg.get("yeswehack", True))
     if ywh_auth_used:
         print(
             "[*] YesWeHack: API key found — using authenticated feed (includes private programs)."
@@ -2282,6 +2310,10 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
     _set_meta(cur, "upstream_sha", upstream_sha)
     _set_meta(cur, "last_sync_ts", str(now_ts))
     _set_meta(cur, "last_refresh_ok", "1" if refresh_ok else "0")
+    # Feed-age anchor: only a real, successful network refresh counts. Offline
+    # imports (refresh=False) and failed fetches must not reset feed age (#9).
+    if refresh and refresh_ok:
+        _set_meta(cur, "last_successful_sync_ts", str(now_ts))
     if refresh_error:
         _set_meta(cur, "last_refresh_error", refresh_error)
     _set_meta(cur, "platform_status", json.dumps(platform_status, sort_keys=True))
@@ -2485,16 +2517,16 @@ def evaluate_targets(config=None):
     if fresh_cfg.get("strict_new_companies", False):
         new_company_days = fresh_cfg.get("new_company_days", 90)
         cutoff_ts = int(time.time()) - (new_company_days * 86400)
-        # Bugcrowd: use official start date; others: use feed first-seen timestamp
+        # STRICT means require Bugcrowd with a recent OFFICIAL start date. Feed
+        # first-seen ("observation") dates on other platforms are only a guess at
+        # newness and stay a SCORING signal — they must not satisfy a strict gate
+        # or non-Bugcrowd programs would slip through as "new" (#7).
         query += (
-            " AND (("
-            "  p.platform='Bugcrowd' AND p.official_start_timestamp IS NOT NULL"
-            "  AND p.official_start_timestamp > ?"
-            ") OR ("
-            "  p.platform!='Bugcrowd' AND p.first_seen_timestamp > ?"
-            "))"
+            " AND p.platform='Bugcrowd'"
+            " AND p.official_start_timestamp IS NOT NULL"
+            " AND p.official_start_timestamp > ?"
         )
-        params.extend([cutoff_ts, cutoff_ts])
+        params.append(cutoff_ts)
 
     query += " GROUP BY p.id"
     rows = cur.execute(query, params).fetchall()
@@ -2622,13 +2654,15 @@ def evaluate_targets(config=None):
         new_assets_count = 0
         if fresh_cfg.get("prefer_new_assets", False):
             new_assets_count = new_asset_counts.get(r["id"], 0)
-            # Only hard-exclude if strict_new_assets is set AND this is a Bugcrowd program
-            # with enrichment data that actually shows no new scope. All other platforms pass.
-            if (
-                fresh_cfg.get("strict_new_assets", False)
-                and r["platform"] == "Bugcrowd"
+            # STRICT means a program must have OFFICIAL evidence of new scope:
+            # Bugcrowd, enriched, with new assets dated in-window. Non-Bugcrowd
+            # programs and undated/un-enriched Bugcrowd ones are observation-only
+            # guesses, so strict mode excludes them rather than admitting them with
+            # zero proven new scope (#7). Observation newness stays scoring-only.
+            if fresh_cfg.get("strict_new_assets", False) and not (
+                r["platform"] == "Bugcrowd"
                 and r["id"] in enriched_program_ids
-                and new_assets_count == 0
+                and new_assets_count > 0
             ):
                 continue
 
@@ -2887,11 +2921,22 @@ def feed_provenance(conn=None):
             conn.close()
 
     now_ts = int(time.time())
-    try:
-        sync_ts = int(meta.get("last_sync_ts", 0) or 0)
-    except (TypeError, ValueError):
-        sync_ts = 0
-    age_hours = round((now_ts - sync_ts) / 3600.0, 1) if sync_ts else None
+
+    def _meta_int(key: str) -> int:
+        try:
+            return int(meta.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    sync_ts = _meta_int("last_sync_ts")
+    # Feed age is measured from the last SUCCESSFUL network refresh, never from
+    # the last time sync_data merely ran: an offline import or a failed fetch
+    # stamps last_sync_ts=now but must not make a stale snapshot look fresh (#9).
+    succ_ts = _meta_int("last_successful_sync_ts")
+    if not succ_ts and meta.get("last_refresh_ok") != "0":
+        # Pre-fix DB whose last run did not fail: fall back to last_sync_ts.
+        succ_ts = sync_ts
+    age_hours = round((now_ts - succ_ts) / 3600.0, 1) if succ_ts else None
 
     gaps = [
         # Structural: no feed carries rules/policy text, so Oracle's verify
@@ -2919,6 +2964,7 @@ def feed_provenance(conn=None):
     return {
         "upstream_sha": meta.get("upstream_sha") or "unknown",
         "last_sync_ts": sync_ts or None,
+        "last_successful_sync_ts": succ_ts or None,
         "age_hours": age_hours,
         "stale": age_hours is not None and age_hours > STALE_AFTER_HOURS,
         "refresh_ok": meta.get("last_refresh_ok") != "0",
@@ -2933,6 +2979,12 @@ def feed_provenance(conn=None):
 
 
 def cmd_filter(args, config):
+    # Migrate the DB before ranking: evaluate_targets references migrated
+    # columns and does not call ensure_schema itself (query-count contract),
+    # so an older DB would raise mid-ranking without this.
+    _schema_conn = get_db()
+    ensure_schema(_schema_conn)
+    _schema_conn.close()
     results = evaluate_targets(config)
     limit = args.limit or config.get("display", {}).get("limit", 20)
     fresh_cfg = config.get("filters", {}).get("freshness_and_competition", {})
@@ -3217,12 +3269,14 @@ def cmd_check(args):
 
 
 def cmd_export(args, config):
+    # Migrate before ranking (see cmd_filter): evaluate_targets hits migrated
+    # columns, so ensure_schema must run first on an older DB.
+    conn = get_db()
+    ensure_schema(conn)
     results = evaluate_targets(config)
     limit = args.top or 30
     target_ids = [p["id"] for p in results[:limit]]
 
-    conn = get_db()
-    ensure_schema(conn)
     cur = conn.cursor()
     if not target_ids:
         return
