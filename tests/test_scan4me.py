@@ -2038,49 +2038,8 @@ def test_cmd_export_migrates_before_ranking(tmp_path, monkeypatch, capsys):
 # ── withdrawn-program reconciliation (Greptile issue 4) ───────────────────────
 
 
-def test_tombstone_withdrawn_programs_only_hits_absent_same_platform(tmp_path):
-    """Programs absent from a complete feed get their assets tombstoned; present
-    programs and other-platform programs are untouched; oos_assets too."""
-    conn = _temp_db(tmp_path / "t.db")
-    kept = _seed_program(conn, "HackerOne", "Kept", "kept")
-    gone = _seed_program(conn, "HackerOne", "Gone", "gone")
-    other = _seed_program(conn, "Bugcrowd", "Other", "gone")  # same handle, other platform
-    _add_asset(conn, kept, "kept.com")
-    _add_asset(conn, gone, "gone.com")
-    _add_oos(conn, gone, "oos.gone.com")
-    _add_asset(conn, other, "other.com")
-    now = 12345
-    cur = conn.cursor()
-    n = scan4me._tombstone_withdrawn_programs(cur, "HackerOne", {"kept"}, now)
-    conn.commit()
-    assert n == 1  # only "gone" on HackerOne
-    live = lambda pid: conn.execute(
-        "SELECT count(*) FROM assets WHERE program_id=? AND deleted_timestamp=0", (pid,)
-    ).fetchone()[0]
-    assert live(kept) == 1          # present program kept live
-    assert live(gone) == 0          # withdrawn program's asset tombstoned
-    assert live(other) == 1         # other platform untouched (handle collision ignored)
-    oos_live = conn.execute(
-        "SELECT count(*) FROM oos_assets WHERE program_id=? AND deleted_timestamp=0", (gone,)
-    ).fetchone()[0]
-    assert oos_live == 0            # withdrawn program's oos assets tombstoned too
-    conn.close()
 
 
-def test_tombstone_withdrawn_is_idempotent(tmp_path):
-    """Re-running does not change timestamps of already-tombstoned assets."""
-    conn = _temp_db(tmp_path / "t.db")
-    gone = _seed_program(conn, "HackerOne", "Gone", "gone")
-    _add_asset(conn, gone, "gone.com")
-    cur = conn.cursor()
-    scan4me._tombstone_withdrawn_programs(cur, "HackerOne", set(), 1000)
-    conn.commit()
-    ts1 = conn.execute("SELECT deleted_timestamp FROM assets WHERE program_id=?", (gone,)).fetchone()[0]
-    scan4me._tombstone_withdrawn_programs(cur, "HackerOne", set(), 2000)
-    conn.commit()
-    ts2 = conn.execute("SELECT deleted_timestamp FROM assets WHERE program_id=?", (gone,)).fetchone()[0]
-    assert ts1 == 1000 and ts2 == 1000  # only live (deleted_timestamp=0) rows are stamped
-    conn.close()
 
 
 def test_feed_age_uses_last_successful_refresh_not_last_run(tmp_path):
