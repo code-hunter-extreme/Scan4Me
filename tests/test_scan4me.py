@@ -2126,3 +2126,51 @@ def test_h1_in_scope_preserves_eligibility_and_restrictions():
     # and _eligibility_of now reads the real values
     bounty, submission, instruction, severity = scan4me._eligibility_of(a)
     assert bounty == 0 and submission == 1 and instruction == "staging only"
+
+
+def test_strict_new_companies_requires_bugcrowd_official_date(tmp_path, monkeypatch):
+    """STRICT new-companies must require Bugcrowd + a recent OFFICIAL start date;
+    a non-Bugcrowd program fresh only by feed-observation date must NOT satisfy
+    the strict gate (#7). Without strict, both still appear (scoring signal)."""
+    db_path = tmp_path / "t.db"
+    conn = _temp_db(db_path)
+    cur = conn.cursor()
+    now = int(time.time())
+    recent = now - 10 * 86400
+    # A: Bugcrowd with a recent OFFICIAL start date → qualifies under strict.
+    cur.execute(
+        """INSERT INTO programs (platform, name, handle, offers_bounties, max_payout,
+           first_response_hours, response_efficiency, first_seen_timestamp,
+           official_start_timestamp)
+           VALUES ('Bugcrowd','BC New','bc-new',1,5000,5.0,95.0,?,?)""",
+        (now - 300 * 86400, recent),
+    )
+    cur.execute("INSERT INTO assets (program_id, asset_identifier, asset_type) "
+                "VALUES (?, 'a.bc.com', 'URL')", (cur.lastrowid,))
+    # B: HackerOne, fresh only by feed first-seen (observation), no official date.
+    cur.execute(
+        """INSERT INTO programs (platform, name, handle, offers_bounties, max_payout,
+           first_response_hours, response_efficiency, first_seen_timestamp)
+           VALUES ('HackerOne','H1 Obs','h1-obs',1,5000,5.0,95.0,?)""",
+        (recent,),
+    )
+    cur.execute("INSERT INTO assets (program_id, asset_identifier, asset_type) "
+                "VALUES (?, 'a.h1.com', 'URL')", (cur.lastrowid,))
+    conn.commit(); conn.close()
+
+    monkeypatch.setattr(scan4me, "DB_PATH", str(db_path))
+
+    cfg = _eval_config(bugcrowd=True, hackerone=True)
+    fresh = cfg["filters"].setdefault("freshness_and_competition", {})
+
+    # Not strict: observation newness is a scoring signal — both appear.
+    fresh.update({"prefer_new_companies": True, "strict_new_companies": False,
+                  "new_company_days": 90})
+    names = {p["name"] for p in scan4me.evaluate_targets(cfg)}
+    assert {"BC New", "H1 Obs"} <= names, names
+
+    # Strict: only the Bugcrowd program with an official date qualifies.
+    fresh["strict_new_companies"] = True
+    strict_names = {p["name"] for p in scan4me.evaluate_targets(cfg)}
+    assert "BC New" in strict_names
+    assert "H1 Obs" not in strict_names, strict_names

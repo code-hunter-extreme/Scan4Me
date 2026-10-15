@@ -2575,16 +2575,16 @@ def evaluate_targets(config=None):
     if fresh_cfg.get("strict_new_companies", False):
         new_company_days = fresh_cfg.get("new_company_days", 90)
         cutoff_ts = int(time.time()) - (new_company_days * 86400)
-        # Bugcrowd: use official start date; others: use feed first-seen timestamp
+        # STRICT means require Bugcrowd with a recent OFFICIAL start date. Feed
+        # first-seen ("observation") dates on other platforms are only a guess at
+        # newness and stay a SCORING signal — they must not satisfy a strict gate
+        # or non-Bugcrowd programs would slip through as "new" (#7).
         query += (
-            " AND (("
-            "  p.platform='Bugcrowd' AND p.official_start_timestamp IS NOT NULL"
-            "  AND p.official_start_timestamp > ?"
-            ") OR ("
-            "  p.platform!='Bugcrowd' AND p.first_seen_timestamp > ?"
-            "))"
+            " AND p.platform='Bugcrowd'"
+            " AND p.official_start_timestamp IS NOT NULL"
+            " AND p.official_start_timestamp > ?"
         )
-        params.extend([cutoff_ts, cutoff_ts])
+        params.append(cutoff_ts)
 
     query += " GROUP BY p.id"
     rows = cur.execute(query, params).fetchall()
@@ -2712,13 +2712,15 @@ def evaluate_targets(config=None):
         new_assets_count = 0
         if fresh_cfg.get("prefer_new_assets", False):
             new_assets_count = new_asset_counts.get(r["id"], 0)
-            # Only hard-exclude if strict_new_assets is set AND this is a Bugcrowd program
-            # with enrichment data that actually shows no new scope. All other platforms pass.
-            if (
-                fresh_cfg.get("strict_new_assets", False)
-                and r["platform"] == "Bugcrowd"
+            # STRICT means a program must have OFFICIAL evidence of new scope:
+            # Bugcrowd, enriched, with new assets dated in-window. Non-Bugcrowd
+            # programs and undated/un-enriched Bugcrowd ones are observation-only
+            # guesses, so strict mode excludes them rather than admitting them with
+            # zero proven new scope (#7). Observation newness stays scoring-only.
+            if fresh_cfg.get("strict_new_assets", False) and not (
+                r["platform"] == "Bugcrowd"
                 and r["id"] in enriched_program_ids
-                and new_assets_count == 0
+                and new_assets_count > 0
             ):
                 continue
 
