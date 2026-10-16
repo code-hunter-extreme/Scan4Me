@@ -468,8 +468,57 @@ DEFAULT_CONFIG = {
 }
 
 
+# Static approximate FX rates to USD for RANKING ONLY. Amounts are compared
+# against USD bands/floors; mixing raw EUR/GBP numbers into those bands
+# silently misranks programs. Unknown currencies convert to 0 (treated as
+# unknown payout, never guessed at par).
+_FX_TO_USD = {
+    "USD": 1.0, "USDC": 1.0, "USDT": 1.0, "DAI": 1.0,
+    "EUR": 1.08, "GBP": 1.27, "CHF": 1.13, "AUD": 0.66, "CAD": 0.73,
+}
+
+
+def _to_usd(amount, currency) -> float:
+    try:
+        value = float(amount or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if value <= 0:
+        return 0.0
+    rate = _FX_TO_USD.get(str(currency or "USD").strip().upper())
+    return value * rate if rate else 0.0
+
+
+def _deep_merge(base, override):
+    """Recursively merge override onto a copy of base (dicts merge, other
+    values replace)."""
+    import copy as _copy
+
+    merged = _copy.deepcopy(base)
+    for key, val in (override or {}).items():
+        if isinstance(val, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], val)
+        else:
+            merged[key] = _copy.deepcopy(val)
+    return merged
+
+
+def _normalize_weights(cfg):
+    weights = cfg.get("ranking_weights")
+    if isinstance(weights, dict) and weights:
+        total = sum(float(v or 0) for v in weights.values())
+        if total > 0:
+            cfg["ranking_weights"] = {
+                k: float(v or 0) / total for k, v in weights.items()
+            }
+    return cfg
+
+
 def load_config():
-    # Priority: config.json (local, git-ignored) → config.example.json → DEFAULT_CONFIG
+    # Priority: config.json (local, git-ignored) → config.example.json → DEFAULT_CONFIG.
+    # File configs are DEEP-MERGED over DEFAULT_CONFIG so a partial file
+    # (one weight, one filter) cannot silently drop every other default,
+    # and ranking weights are normalized to sum to 1.
     for path in (CONFIG_PATH, CONFIG_EXAMPLE_PATH):
         if path.exists():
             try:
@@ -480,10 +529,10 @@ def load_config():
                         f"[*] config.json not found — using {path.name} (template). "
                         "Copy it to config.json and set your API keys."
                     )
-                return cfg
+                return _normalize_weights(_deep_merge(DEFAULT_CONFIG, cfg))
             except Exception as e:
                 print(f"[!] Warning: Failed to load {path.name} ({e}), trying next.")
-    return DEFAULT_CONFIG
+    return _normalize_weights(_deep_merge(DEFAULT_CONFIG, {}))
 
 
 def get_db():
@@ -518,10 +567,17 @@ def init_db(conn):
                 report_resolved_hours REAL,
                 response_efficiency REAL,
                 max_payout REAL DEFAULT 0,
+                min_payout REAL DEFAULT 0,
                 currency TEXT DEFAULT 'USD',
                 safe_harbor TEXT,
+                submission_state TEXT DEFAULT 'open',
+                offers_swag BOOLEAN DEFAULT 0,
+                allows_disclosure BOOLEAN DEFAULT 0,
+                company_handle TEXT DEFAULT '',
+                rules_text TEXT DEFAULT '',
                 first_seen_timestamp INTEGER DEFAULT 0,
                 last_updated_timestamp INTEGER DEFAULT 0,
+                deleted_timestamp INTEGER DEFAULT 0,
                 official_start_timestamp INTEGER,
                 official_scope_updated_timestamp INTEGER,
                 rewarded_vulnerabilities INTEGER,
@@ -576,6 +632,24 @@ def init_db(conn):
                 UNIQUE(platform, handle)
             );
 
+            CREATE TABLE site_scans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target TEXT NOT NULL UNIQUE,
+                final_url TEXT,
+                status_code INTEGER,
+                headers_json TEXT,
+                security_headers_json TEXT,
+                cookies_json TEXT,
+                title TEXT,
+                body_sha256 TEXT,
+                body_length INTEGER,
+                auth_surfaces_json TEXT,
+                public_endpoints_json TEXT,
+                security_txt TEXT,
+                robots_txt TEXT,
+                scanned_at INTEGER DEFAULT 0
+            );
+
             CREATE INDEX idx_asset_identifier ON assets(asset_identifier);
             CREATE INDEX idx_asset_program_live ON assets(program_id, deleted_timestamp);
             CREATE INDEX idx_oos_program_live ON oos_assets(program_id, deleted_timestamp);
@@ -628,6 +702,13 @@ def migrate_db(conn):
         ("average_payout", "REAL"),
         ("official_metadata_checked_timestamp", "INTEGER"),
         ("program_kind", "TEXT DEFAULT 'web2'"),
+        ("deleted_timestamp", "INTEGER DEFAULT 0"),
+        ("min_payout", "REAL DEFAULT 0"),
+        ("submission_state", "TEXT DEFAULT 'open'"),
+        ("offers_swag", "BOOLEAN DEFAULT 0"),
+        ("allows_disclosure", "BOOLEAN DEFAULT 0"),
+        ("company_handle", "TEXT DEFAULT ''"),
+        ("rules_text", "TEXT DEFAULT ''"),
     ):
         if column not in prog_cols:
             cur.execute(f"ALTER TABLE programs ADD COLUMN {column} {definition}")
@@ -702,6 +783,27 @@ def migrate_db(conn):
         "CREATE INDEX IF NOT EXISTS idx_contest_first_seen "
         "ON contests(first_seen_timestamp)"
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS site_scans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target TEXT NOT NULL UNIQUE,
+            final_url TEXT,
+            status_code INTEGER,
+            headers_json TEXT,
+            security_headers_json TEXT,
+            cookies_json TEXT,
+            title TEXT,
+            body_sha256 TEXT,
+            body_length INTEGER,
+            auth_surfaces_json TEXT,
+            public_endpoints_json TEXT,
+            security_txt TEXT,
+            robots_txt TEXT,
+            scanned_at INTEGER DEFAULT 0
+        )
+        """
+    )
 
     # P6: Sherlock audit contests are not bug-bounty programs. Move any legacy
     # contest rows out of programs into contests. Idempotent: once moved, no
@@ -746,11 +848,13 @@ def _eligibility_of(target):
 
     Feeds without eligibility keys (Bugcrowd/Intigriti/YWH/...) default to
     eligible — unknown means "no signal", never "forbidden".
+    Extracts public per-asset descriptions/impacts (Intigriti) alongside
+    HackerOne instruction/max_severity keys.
     """
     bounty = target.get("eligible_for_bounty", True)
     submission = target.get("eligible_for_submission", True)
-    instruction = target.get("instruction") or ""
-    severity = target.get("max_severity") or ""
+    instruction = target.get("instruction") or target.get("description") or ""
+    severity = target.get("max_severity") or target.get("impact") or ""
     return (
         0 if bounty is False or bounty == 0 else 1,
         0 if submission is False or submission == 0 else 1,
@@ -1160,6 +1264,8 @@ def enrich_bugcrowd_program(conn, program_id, handle, now_ts=None):
 
     program_start = None
     scope_history = []
+    latest_rules_text = ""
+    latest_rules_ts = -1
     for entry in entries:
         version_timestamp = parse_public_timestamp(entry.get("publishedAt"))
         if not version_timestamp:
@@ -1173,6 +1279,22 @@ def enrich_bugcrowd_program(conn, program_id, handle, now_ts=None):
             start = parse_public_timestamp(data.get("engagement", {}).get("startsAt"))
             if start:
                 program_start = start
+            brief = data.get("brief") if isinstance(data.get("brief"), dict) else {}
+            eng = (
+                data.get("engagement")
+                if isinstance(data.get("engagement"), dict)
+                else {}
+            )
+            candidate_rules = (
+                brief.get("description")
+                or brief.get("targetsOverview")
+                or eng.get("description")
+                or data.get("targetsOverview")
+                or ""
+            )
+            if candidate_rules and version_timestamp >= latest_rules_ts:
+                latest_rules_text = str(candidate_rules).strip()
+                latest_rules_ts = version_timestamp
             scope_history.append(
                 (version_timestamp, bugcrowd_scope_aliases(data.get("scope")))
             )
@@ -1196,7 +1318,7 @@ def enrich_bugcrowd_program(conn, program_id, handle, now_ts=None):
     asset_rows = cur.execute(
         "SELECT id, asset_identifier FROM assets"
         " WHERE program_id=? AND deleted_timestamp=0",
-        (program_id,)
+        (program_id,),
     ).fetchall()
     first_added = {}
     for version_timestamp, aliases in sorted(scope_history):
@@ -1213,7 +1335,8 @@ def enrich_bugcrowd_program(conn, program_id, handle, now_ts=None):
                    rewarded_vulnerabilities=?,
                    validation_days=?,
                    average_payout=?,
-                   official_metadata_checked_timestamp=?
+                   official_metadata_checked_timestamp=?,
+                   rules_text=CASE WHEN ? != '' THEN ? ELSE rules_text END
                WHERE id=?""",
             (
                 program_start,
@@ -1222,6 +1345,8 @@ def enrich_bugcrowd_program(conn, program_id, handle, now_ts=None):
                 validation_days,
                 average_payout,
                 now_ts,
+                latest_rules_text,
+                latest_rules_text,
                 program_id,
             ),
         )
@@ -1244,6 +1369,7 @@ def enrich_bugcrowd_program(conn, program_id, handle, now_ts=None):
         "rewarded_vulnerabilities": rewarded if isinstance(rewarded, int) else None,
         "validation_days": validation_days,
         "average_payout": average_payout,
+        "rules_text_length": len(latest_rules_text),
     }
 
 
@@ -1557,18 +1683,50 @@ def _platform_status(enabled, data, source, auth_used=False):
     return {"status": "ok", "count": len(data), "source": source}
 
 
+def _reconcile_platform_programs(cur, platform, seen_handles, now_ts):
+    """Tombstone programs for ``platform`` that vanished from a valid sync feed.
 
-def sync_data(refresh=True, platforms_cfg=None, config=None):
+    Truncation guard: if ``seen_handles`` is empty, or the feed reports at
+    most half of the previously live programs, skip tombstoning entirely so
+    a truncated upstream feed never mass-deletes active programs. The guard
+    applies at every platform size; a genuine >50% platform shrink simply
+    waits for the next confirming sync.
+    """
+    clean_seen = {str(h).strip() for h in (seen_handles or ()) if h}
+    if not clean_seen:
+        return 0
+    existing_live = cur.execute(
+        "SELECT id, handle FROM programs WHERE platform=? AND COALESCE(deleted_timestamp, 0)=0",
+        (platform,),
+    ).fetchall()
+    if existing_live and len(clean_seen) * 2 <= len(existing_live):
+        return 0
+    stale_ids = [
+        row["id"]
+        for row in existing_live
+        if str(row["handle"] or "").strip() not in clean_seen
+    ]
+    if stale_ids:
+        cur.executemany(
+            "UPDATE programs SET deleted_timestamp=? WHERE id=?",
+            ((now_ts, pid) for pid in stale_ids),
+        )
+    return len(stale_ids)
+
+
+def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
     """Sync all enabled feed sources into the local SQLite database.
 
-    When api_keys are configured (config.json or env vars) the authenticated API
-    is used instead of the public feed — gives access to private/invite programs.
-    Falls back to the public arkadiyt feed automatically when no key is present.
+    By default Scan4Me operates in UNAUTHENTICATED mode (``use_auth=False`` unless
+    explicitly enabled via ``use_auth=True`` or ``config["use_auth"]=True``),
+    harvesting maximum public program & scope intelligence without signing in so
+    Oracle can compare its saved-credential scans against Scan4Me's unauthenticated
+    baseline.
 
-    Core feeds (arkadiyt/bounty-targets-data, public fallback):
+    Core feeds (arkadiyt/bounty-targets-data, public unauthenticated):
       HackerOne, Bugcrowd, Intigriti, YesWeHack, Federacy
 
-    Authenticated feeds (when api_key configured):
+    Authenticated feeds (when use_auth=True and api_key configured):
       HackerOne  — api.hackerone.com/v1/hackers/programs  (Basic username:token)
       Bugcrowd   — api.bugcrowd.com/engagements           (Token header)
       Intigriti  — api.intigriti.com/core/researcher/...  (Bearer token)
@@ -1583,7 +1741,15 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
       Indexed as platform='PDPrograms'.  Skipped when unavailable.
     """
     platforms_cfg = platforms_cfg or {}
-    creds = load_credentials(config or load_config())
+    loaded_cfg = config if config is not None else load_config()
+    creds = load_credentials(loaded_cfg)
+    # Default: unauthenticated public scan unless use_auth is explicitly True
+    # or no public feed file exists for an enabled platform when refresh=True.
+    auth_enabled = (
+        bool(use_auth)
+        if use_auth is not None
+        else bool((loaded_cfg or {}).get("use_auth", False))
+    )
     CACHE_DATA_DIR.mkdir(parents=True, exist_ok=True)
     repo_dir = CACHE_DATA_DIR / "repo"
     cached_repo_data = repo_dir / "data"
@@ -1658,18 +1824,16 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
     platform_status = {}
     ingest_stats = {}  # per-platform normalizer reject counts (tripwire)
 
-    # 1. HackerOne — authenticated API when keys present, public feed fallback
-    # NOTE: there is NO fallback from a failed authenticated fetch to the
-    # public feed — an auth failure yields an empty list and old rows linger
-    # untouched (recorded as auth_empty in sync_metadata below).
+    # 1. HackerOne — unauthenticated public feed by default; authenticated API when opted in
     h1_creds = creds.get("hackerone", {})
     h1_username = h1_creds.get("username")
     h1_token = h1_creds.get("api_token")
-    # `refresh` gates every network call: an offline run (refresh=False) must
-    # use cached feed data only and never hit an authenticated API, matching the
-    # immunefi/sherlock/pd_programs `*_attempted` flags below.
     h1_auth_used = bool(
-        refresh and h1_username and h1_token and platforms_cfg.get("hackerone", True)
+        refresh
+        and auth_enabled
+        and h1_username
+        and h1_token
+        and platforms_cfg.get("hackerone", True)
     )
     if h1_auth_used:
         print(
@@ -1679,15 +1843,16 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
         h1_source = "authenticated"
     else:
         if bool(h1_username) != bool(h1_token):
-            # Exactly one of username/token supplied — genuinely incomplete.
             print(
                 "[!] HackerOne: partial credentials (need both username + api_token) — using public feed."
             )
         elif h1_username and h1_token and not refresh:
-            # Complete credentials, skipped only because this is an offline run —
-            # not a credential problem; don't send the user chasing one.
             print(
                 "[*] HackerOne: offline mode — authenticated fetch skipped, using cached public feed."
+            )
+        elif h1_username and h1_token and not auth_enabled:
+            print(
+                "[*] HackerOne: unauthenticated mode — using public feed (Oracle compares saved credentials against Scan4Me)."
             )
         h1_file = local_data_dir / "hackerone_data.json"
         if h1_file.exists():
@@ -1698,9 +1863,12 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
         h1_source = "public-file"
 
     if h1_data and platforms_cfg.get("hackerone", True):
+        h1_seen_handles = set()
         with conn:
             for p in h1_data:
                 handle = p.get("handle")
+                if handle:
+                    h1_seen_handles.add(str(handle))
                 name = p.get("name") or handle
                 url = p.get("url") or f"https://hackerone.com/{handle}"
                 website = p.get("website") or ""
@@ -1710,6 +1878,9 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                 bounty_time = p.get("average_time_to_bounty_awarded")
                 resolved_time = p.get("average_time_to_report_resolved")
                 efficiency = p.get("response_efficiency_percentage")
+                sub_state = str(p.get("submission_state") or "open")
+                offers_swag = bool(p.get("offers_swag", False))
+                rules_txt = str(p.get("policy") or p.get("rules_text") or "")
 
                 existing = cur.execute(
                     "SELECT id, first_seen_timestamp, last_updated_timestamp"
@@ -1724,8 +1895,9 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     INSERT INTO programs (
                         platform, name, handle, url, website, offers_bounties, managed_triage,
                         first_response_hours, bounty_awarded_hours, report_resolved_hours,
-                        response_efficiency, currency, first_seen_timestamp, last_updated_timestamp
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'USD', ?, ?)
+                        response_efficiency, currency, submission_state, offers_swag, rules_text,
+                        first_seen_timestamp, last_updated_timestamp, deleted_timestamp
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'USD', ?, ?, ?, ?, ?, 0)
                     ON CONFLICT(platform, handle) DO UPDATE SET
                         name=excluded.name, url=excluded.url, website=excluded.website,
                         offers_bounties=excluded.offers_bounties,
@@ -1735,7 +1907,11 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                         report_resolved_hours=excluded.report_resolved_hours,
                         response_efficiency=excluded.response_efficiency,
                         currency=excluded.currency,
-                        last_updated_timestamp=excluded.last_updated_timestamp
+                        submission_state=excluded.submission_state,
+                        offers_swag=excluded.offers_swag,
+                        rules_text=CASE WHEN excluded.rules_text != '' THEN excluded.rules_text ELSE programs.rules_text END,
+                        last_updated_timestamp=excluded.last_updated_timestamp,
+                        deleted_timestamp=0
                 """,
                     (
                         "HackerOne",
@@ -1749,6 +1925,9 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                         bounty_time,
                         resolved_time,
                         efficiency,
+                        sub_state,
+                        offers_swag,
+                        rules_txt,
                         first_seen,
                         last_upd,
                     ),
@@ -1767,14 +1946,17 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     now_ts,
                     stats=ingest_stats.setdefault("hackerone", {}),
                 )
+            _reconcile_platform_programs(cur, "HackerOne", h1_seen_handles, now_ts)
         print(f"[+] HackerOne indexed: {len(h1_data)} programs.")
     platform_status["hackerone"] = _platform_status(
         platforms_cfg.get("hackerone", True), h1_data, h1_source, h1_auth_used
     )
 
-    # 2. Bugcrowd — authenticated API when key present, public feed fallback
+    # 2. Bugcrowd — unauthenticated public feed by default; authenticated API when opted in
     bc_token = creds.get("bugcrowd", {}).get("api_token")
-    bc_auth_used = bool(refresh and bc_token and platforms_cfg.get("bugcrowd", True))
+    bc_auth_used = bool(
+        refresh and auth_enabled and bc_token and platforms_cfg.get("bugcrowd", True)
+    )
     if bc_auth_used:
         print(
             "[*] Bugcrowd: API key found — using authenticated feed (includes private programs)."
@@ -1791,6 +1973,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
         bc_source = "public-file"
 
     if bc_data and platforms_cfg.get("bugcrowd", True):
+        bc_seen_handles = set()
         with conn:
             for p in bc_data:
                 name = p.get("name", "Unknown")
@@ -1798,10 +1981,14 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                 if url.startswith("/"):
                     url = f"https://bugcrowd.com{url}"
                 handle = url.rstrip("/").split("/")[-1]
+                if handle:
+                    bc_seen_handles.add(str(handle))
                 max_p = float(p.get("max_payout", 0) or 0)
                 offers_bounty = max_p > 0
                 managed = bool(p.get("managed_by_bugcrowd"))
                 safe = p.get("safe_harbor", "Standard")
+                allows_disc = bool(p.get("allows_disclosure", False))
+                rules_txt = str(p.get("description") or p.get("rules_text") or "")
 
                 existing = cur.execute(
                     "SELECT id, first_seen_timestamp, last_updated_timestamp"
@@ -1815,15 +2002,19 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     """
                     INSERT INTO programs (
                         platform, name, handle, url, website, offers_bounties, managed_triage,
-                        max_payout, currency, safe_harbor, first_seen_timestamp, last_updated_timestamp
-                    ) VALUES (?, ?, ?, ?, '', ?, ?, ?, 'USD', ?, ?, ?)
+                        max_payout, currency, safe_harbor, allows_disclosure, rules_text,
+                        first_seen_timestamp, last_updated_timestamp, deleted_timestamp
+                    ) VALUES (?, ?, ?, ?, '', ?, ?, ?, 'USD', ?, ?, ?, ?, ?, 0)
                     ON CONFLICT(platform, handle) DO UPDATE SET
                         name=excluded.name, url=excluded.url,
                         offers_bounties=excluded.offers_bounties,
                         managed_triage=excluded.managed_triage,
                         max_payout=excluded.max_payout, currency=excluded.currency,
                         safe_harbor=excluded.safe_harbor,
-                        last_updated_timestamp=excluded.last_updated_timestamp
+                        allows_disclosure=excluded.allows_disclosure,
+                        rules_text=CASE WHEN excluded.rules_text != '' THEN excluded.rules_text ELSE programs.rules_text END,
+                        last_updated_timestamp=excluded.last_updated_timestamp,
+                        deleted_timestamp=0
                 """,
                     (
                         "Bugcrowd",
@@ -1834,6 +2025,8 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                         managed,
                         max_p,
                         safe,
+                        allows_disc,
+                        rules_txt,
                         first_seen,
                         last_upd,
                     ),
@@ -1852,14 +2045,17 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     now_ts,
                     stats=ingest_stats.setdefault("bugcrowd", {}),
                 )
+            _reconcile_platform_programs(cur, "Bugcrowd", bc_seen_handles, now_ts)
         print(f"[+] Bugcrowd indexed: {len(bc_data)} programs.")
     platform_status["bugcrowd"] = _platform_status(
         platforms_cfg.get("bugcrowd", True), bc_data, bc_source, bc_auth_used
     )
 
-    # 3. Intigriti — authenticated API when key present, public feed fallback
+    # 3. Intigriti — unauthenticated public feed by default; authenticated API when opted in
     inti_token = creds.get("intigriti", {}).get("api_token")
-    inti_auth_used = bool(refresh and inti_token and platforms_cfg.get("intigriti", True))
+    inti_auth_used = bool(
+        refresh and auth_enabled and inti_token and platforms_cfg.get("intigriti", True)
+    )
     if inti_auth_used:
         print(
             "[*] Intigriti: API key found — using authenticated feed (includes private programs)."
@@ -1876,19 +2072,30 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
         inti_source = "public-file"
 
     if inti_data and platforms_cfg.get("intigriti", True):
+        inti_seen_handles = set()
         with conn:
             for p in inti_data:
                 name = p.get("name", "Unknown")
                 handle = p.get("handle") or str(p.get("id"))
+                if handle:
+                    inti_seen_handles.add(str(handle))
                 url = p.get("url", "")
                 max_b = p.get("max_bounty", {})
                 max_val = (
                     float(max_b.get("value", 0) or 0) if isinstance(max_b, dict) else 0
                 )
+                min_b = p.get("min_bounty", {})
+                min_val = (
+                    float(min_b.get("value", 0) or 0) if isinstance(min_b, dict) else 0
+                )
                 curr = (
                     max_b.get("currency", "EUR") if isinstance(max_b, dict) else "EUR"
                 )
                 offers_bounty = max_val > 0
+                company_handle = str(p.get("company_handle") or "")
+                sub_state = str(
+                    p.get("status") or p.get("confidentiality_level") or "open"
+                )
 
                 existing = cur.execute(
                     "SELECT id, first_seen_timestamp, last_updated_timestamp"
@@ -1902,14 +2109,20 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     """
                     INSERT INTO programs (
                         platform, name, handle, url, website, offers_bounties, managed_triage,
-                        max_payout, currency, first_seen_timestamp, last_updated_timestamp
-                    ) VALUES (?, ?, ?, ?, '', ?, 1, ?, ?, ?, ?)
+                        max_payout, min_payout, currency, company_handle, submission_state,
+                        first_seen_timestamp, last_updated_timestamp, deleted_timestamp
+                    ) VALUES (?, ?, ?, ?, '', ?, 1, ?, ?, ?, ?, ?, ?, ?, 0)
                     ON CONFLICT(platform, handle) DO UPDATE SET
                         name=excluded.name, url=excluded.url,
                         offers_bounties=excluded.offers_bounties,
                         managed_triage=excluded.managed_triage,
-                        max_payout=excluded.max_payout, currency=excluded.currency,
-                        last_updated_timestamp=excluded.last_updated_timestamp
+                        max_payout=excluded.max_payout,
+                        min_payout=excluded.min_payout,
+                        currency=excluded.currency,
+                        company_handle=excluded.company_handle,
+                        submission_state=excluded.submission_state,
+                        last_updated_timestamp=excluded.last_updated_timestamp,
+                        deleted_timestamp=0
                 """,
                     (
                         "Intigriti",
@@ -1918,7 +2131,10 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                         url,
                         offers_bounty,
                         max_val,
+                        min_val,
                         curr,
+                        company_handle,
+                        sub_state,
                         first_seen,
                         last_upd,
                     ),
@@ -1937,14 +2153,17 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     now_ts,
                     stats=ingest_stats.setdefault("intigriti", {}),
                 )
+            _reconcile_platform_programs(cur, "Intigriti", inti_seen_handles, now_ts)
         print(f"[+] Intigriti indexed: {len(inti_data)} programs.")
     platform_status["intigriti"] = _platform_status(
         platforms_cfg.get("intigriti", True), inti_data, inti_source, inti_auth_used
     )
 
-    # 4. YesWeHack — authenticated API when key present, public feed fallback
+    # 4. YesWeHack — unauthenticated public feed by default; authenticated API when opted in
     ywh_token = creds.get("yeswehack", {}).get("api_token")
-    ywh_auth_used = bool(refresh and ywh_token and platforms_cfg.get("yeswehack", True))
+    ywh_auth_used = bool(
+        refresh and auth_enabled and ywh_token and platforms_cfg.get("yeswehack", True)
+    )
     if ywh_auth_used:
         print(
             "[*] YesWeHack: API key found — using authenticated feed (includes private programs)."
@@ -1961,13 +2180,18 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
         ywh_source = "public-file"
 
     if ywh_data and platforms_cfg.get("yeswehack", True):
+        ywh_seen_handles = set()
         with conn:
             for p in ywh_data:
                 name = p.get("name", "Unknown")
                 handle = str(p.get("id"))
+                if handle:
+                    ywh_seen_handles.add(handle)
                 max_val = float(p.get("max_bounty", 0) or 0)
+                min_val = float(p.get("min_bounty", 0) or 0)
                 offers_bounty = max_val > 0
                 managed = bool(p.get("managed"))
+                sub_state = "disabled" if p.get("disabled") else "open"
 
                 existing = cur.execute(
                     "SELECT id, first_seen_timestamp, last_updated_timestamp"
@@ -1981,14 +2205,19 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     """
                     INSERT INTO programs (
                         platform, name, handle, url, website, offers_bounties, managed_triage,
-                        max_payout, currency, first_seen_timestamp, last_updated_timestamp
-                    ) VALUES (?, ?, ?, ?, '', ?, ?, ?, 'EUR', ?, ?)
+                        max_payout, min_payout, currency, submission_state,
+                        first_seen_timestamp, last_updated_timestamp, deleted_timestamp
+                    ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, 'EUR', ?, ?, ?, 0)
                     ON CONFLICT(platform, handle) DO UPDATE SET
                         name=excluded.name, url=excluded.url,
                         offers_bounties=excluded.offers_bounties,
                         managed_triage=excluded.managed_triage,
-                        max_payout=excluded.max_payout, currency=excluded.currency,
-                        last_updated_timestamp=excluded.last_updated_timestamp
+                        max_payout=excluded.max_payout,
+                        min_payout=excluded.min_payout,
+                        currency=excluded.currency,
+                        submission_state=excluded.submission_state,
+                        last_updated_timestamp=excluded.last_updated_timestamp,
+                        deleted_timestamp=0
                 """,
                     (
                         "YesWeHack",
@@ -1998,6 +2227,8 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                         offers_bounty,
                         managed,
                         max_val,
+                        min_val,
+                        sub_state,
                         first_seen,
                         last_upd,
                     ),
@@ -2016,6 +2247,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     now_ts,
                     stats=ingest_stats.setdefault("yeswehack", {}),
                 )
+            _reconcile_platform_programs(cur, "YesWeHack", ywh_seen_handles, now_ts)
         print(f"[+] YesWeHack indexed: {len(ywh_data)} programs.")
     platform_status["yeswehack"] = _platform_status(
         platforms_cfg.get("yeswehack", True), ywh_data, ywh_source, ywh_auth_used
@@ -2027,10 +2259,13 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
     if fed_file.exists() and platforms_cfg.get("federacy", True):
         with open(fed_file, encoding="utf-8") as f:
             fed_data = json.load(f)
+        fed_seen_handles = set()
         with conn:
             for p in fed_data:
                 name = p.get("name", "Unknown")
                 handle = str(p.get("id") or name.lower().replace(" ", "-"))
+                if handle:
+                    fed_seen_handles.add(handle)
                 url = p.get("url", "")
                 offers_bounty = bool(p.get("offers_awards", False))
 
@@ -2046,12 +2281,14 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     """
                     INSERT INTO programs (
                         platform, name, handle, url, website, offers_bounties, managed_triage,
-                        max_payout, currency, program_kind, first_seen_timestamp, last_updated_timestamp
-                    ) VALUES (?, ?, ?, ?, '', ?, 0, 0, 'USD', 'web2', ?, ?)
+                        max_payout, currency, program_kind, first_seen_timestamp, last_updated_timestamp,
+                        deleted_timestamp
+                    ) VALUES (?, ?, ?, ?, '', ?, 0, 0, 'USD', 'web2', ?, ?, 0)
                     ON CONFLICT(platform, handle) DO UPDATE SET
                         name=excluded.name, url=excluded.url,
                         offers_bounties=excluded.offers_bounties,
-                        last_updated_timestamp=excluded.last_updated_timestamp
+                        last_updated_timestamp=excluded.last_updated_timestamp,
+                        deleted_timestamp=0
                 """,
                     ("Federacy", name, handle, url, offers_bounty, first_seen, last_upd),
                 )
@@ -2069,6 +2306,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                     now_ts,
                     stats=ingest_stats.setdefault("federacy", {}),
                 )
+            _reconcile_platform_programs(cur, "Federacy", fed_seen_handles, now_ts)
         print(f"[+] Federacy indexed: {len(fed_data)} programs.")
     elif not fed_file.exists():
         print("[*] Federacy feed not found in repo — skipping.")
@@ -2085,9 +2323,12 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
         print("[*] Fetching Immunefi programs (Web3/DeFi live feed)...")
         immunefi_programs = _fetch_immunefi_programs()
         if immunefi_programs:
+            im_seen_handles = set()
             with conn:
                 for p in immunefi_programs:
                     handle = p["handle"]
+                    if handle:
+                        im_seen_handles.add(str(handle))
                     existing = cur.execute(
                         "SELECT id, first_seen_timestamp FROM programs WHERE platform=? AND handle=?",
                         ("Immunefi", handle),
@@ -2098,13 +2339,15 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                         """
                         INSERT INTO programs (
                             platform, name, handle, url, website, offers_bounties, managed_triage,
-                            max_payout, currency, program_kind, first_seen_timestamp, last_updated_timestamp
-                        ) VALUES (?, ?, ?, ?, '', ?, 0, ?, 'USD', 'web3', ?, ?)
+                            max_payout, currency, program_kind, first_seen_timestamp, last_updated_timestamp,
+                            deleted_timestamp
+                        ) VALUES (?, ?, ?, ?, '', ?, 0, ?, 'USD', 'web3', ?, ?, 0)
                         ON CONFLICT(platform, handle) DO UPDATE SET
                             name=excluded.name, url=excluded.url,
                             offers_bounties=excluded.offers_bounties,
                             max_payout=excluded.max_payout,
-                            last_updated_timestamp=excluded.last_updated_timestamp
+                            last_updated_timestamp=excluded.last_updated_timestamp,
+                            deleted_timestamp=0
                     """,
                         (
                             "Immunefi",
@@ -2127,6 +2370,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                         {"addr": a, "kind": "SmartContract"} for a in p["assets"]
                     ]
                     sync_assets(cur, prog_id, asset_targets, "addr", "kind", now_ts)
+                _reconcile_platform_programs(cur, "Immunefi", im_seen_handles, now_ts)
             print(f"[+] Immunefi indexed: {len(immunefi_programs)} programs.")
         else:
             print(
@@ -2234,6 +2478,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
             if pd_programs_list:
                 try:
                     count = 0
+                    pd_seen_handles = set()
                     with conn:
                         for p in pd_programs_list:
                             if not isinstance(p, dict):
@@ -2242,6 +2487,8 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                             if not name:
                                 continue
                             handle = name.lower().replace(" ", "-")[:80]
+                            if handle:
+                                pd_seen_handles.add(handle)
                             url = p.get("url") or p.get("bounty_url") or ""
                             domains = p.get("domains") or []
                             offers_bounty = bool(p.get("bounty", False))
@@ -2257,12 +2504,13 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                                 INSERT INTO programs (
                                     platform, name, handle, url, website, offers_bounties,
                                     managed_triage, max_payout, currency, program_kind,
-                                    first_seen_timestamp, last_updated_timestamp
-                                ) VALUES (?, ?, ?, ?, '', ?, 0, 0, 'USD', 'web2', ?, ?)
+                                    first_seen_timestamp, last_updated_timestamp, deleted_timestamp
+                                ) VALUES (?, ?, ?, ?, '', ?, 0, 0, 'USD', 'web2', ?, ?, 0)
                                 ON CONFLICT(platform, handle) DO UPDATE SET
                                     name=excluded.name, url=excluded.url,
                                     offers_bounties=excluded.offers_bounties,
-                                    last_updated_timestamp=excluded.last_updated_timestamp
+                                    last_updated_timestamp=excluded.last_updated_timestamp,
+                                    deleted_timestamp=0
                             """,
                                 (
                                     "PDPrograms",
@@ -2284,6 +2532,9 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
                             ]
                             sync_assets(cur, prog_id, domain_targets, "d", "t", now_ts)
                             count += 1
+                        _reconcile_platform_programs(
+                            cur, "PDPrograms", pd_seen_handles, now_ts
+                        )
                     print(f"[+] ProjectDiscovery programs indexed: {count} programs.")
                 except sqlite3.Error as e:
                     print(f"[!] ProjectDiscovery DB index error — skipping: {e}")
@@ -2307,6 +2558,26 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
     for _plat, _st in ingest_stats.items():
         if _plat in platform_status and _st.get("rejected"):
             platform_status[_plat]["rejected_assets"] = _st["rejected"]
+    # Preserve pre-fix last_sync_ts as last_successful_sync_ts before an offline
+    # run overwrites last_sync_ts, so offline syncs never reset feed age (#9).
+    if not refresh:
+        prev_succ = cur.execute(
+            "SELECT value FROM sync_metadata WHERE key='last_successful_sync_ts'"
+        ).fetchone()
+        prev_sync = cur.execute(
+            "SELECT value FROM sync_metadata WHERE key='last_sync_ts'"
+        ).fetchone()
+        prev_ok = cur.execute(
+            "SELECT value FROM sync_metadata WHERE key='last_refresh_ok'"
+        ).fetchone()
+        if (
+            prev_succ is None
+            and prev_sync is not None
+            and (prev_ok is None or prev_ok[0] != "0")
+        ):
+            _set_meta(cur, "last_successful_sync_ts", str(prev_sync[0]))
+        elif prev_succ is None and prev_sync is None:
+            _set_meta(cur, "last_sync_ts_offline_only", "1")
     _set_meta(cur, "upstream_sha", upstream_sha)
     _set_meta(cur, "last_sync_ts", str(now_ts))
     _set_meta(cur, "last_refresh_ok", "1" if refresh_ok else "0")
@@ -2314,6 +2585,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
     # imports (refresh=False) and failed fetches must not reset feed age (#9).
     if refresh and refresh_ok:
         _set_meta(cur, "last_successful_sync_ts", str(now_ts))
+        _set_meta(cur, "last_sync_ts_offline_only", "0")
     if refresh_error:
         _set_meta(cur, "last_refresh_error", refresh_error)
     _set_meta(cur, "platform_status", json.dumps(platform_status, sort_keys=True))
@@ -2329,7 +2601,9 @@ def sync_data(refresh=True, platforms_cfg=None, config=None):
         print("[*] Initial feed baseline recorded; current entries are not marked new.")
     conn.commit()
 
-    total_progs = cur.execute("SELECT count(*) FROM programs").fetchone()[0]
+    total_progs = cur.execute(
+        "SELECT count(*) FROM programs WHERE COALESCE(deleted_timestamp, 0)=0"
+    ).fetchone()[0]
     total_assets = cur.execute(
         "SELECT count(*) FROM assets WHERE deleted_timestamp=0"
     ).fetchone()[0]
@@ -2495,8 +2769,9 @@ def evaluate_targets(config=None):
         "SELECT p.*, count(a.id) as asset_count, sum(a.is_wildcard) as wildcard_count "  # nosec B608
         "FROM programs p "
         "LEFT JOIN assets a ON p.id = a.program_id "
-        "AND a.deleted_timestamp=0 "
-        "WHERE p.platform IN (" + plat_holders + ")"
+        "AND a.deleted_timestamp=0 AND a.eligible_for_submission=1 "
+        "WHERE COALESCE(p.deleted_timestamp, 0)=0 AND p.platform IN ("
+        + plat_holders + ")"
     )
     params = list(target_plats)
 
@@ -2627,7 +2902,7 @@ def evaluate_targets(config=None):
         # floor. Unknown ceilings (max_payout NULL/0, e.g. all of HackerOne)
         # pass through — unknown ≠ cheap.
         if min_max_payout is not None:
-            _ceiling = r["max_payout"] or 0
+            _ceiling = _to_usd(r["max_payout"], r["currency"])
             if _ceiling > 0 and _ceiling < min_max_payout:
                 continue
 
@@ -2672,8 +2947,9 @@ def evaluate_targets(config=None):
         # <=168h = +15 pts; <=336h = +8 pts); gated by prioritize_fast_cash.
         # Bugcrowd: validation_days <= 7 = +20 pts; <= 14 = +10 pts (fast-cash proxy).
         # Managed triage earns +5 when prefer_managed_triage is set.
-        # Other platforms default to 50 (no published measurement).
-        speed_score = 50.0
+        # No published measurement is LOW-CONFIDENCE 30, not a neutral 50:
+        # unknown must never outrank a measured-average program on a guess.
+        speed_score = 30.0
         if r["platform"] == "HackerOne":
             if r["first_response_hours"] is not None:
                 speed_score = max(0, 100 - (r["first_response_hours"] * 1.5))
@@ -2687,6 +2963,9 @@ def evaluate_targets(config=None):
             and r["platform"] == "Bugcrowd"
             and r["validation_days"] is not None
         ):
+            # A published validation time IS a measurement: start from the
+            # measured-neutral 50, not the unknown 30.
+            speed_score = 50.0
             if r["validation_days"] <= 7:
                 speed_score = min(100.0, speed_score + 20)
             elif r["validation_days"] <= 14:
@@ -2696,12 +2975,16 @@ def evaluate_targets(config=None):
         speed_score = min(100.0, speed_score)
 
         # 2. Attack Surface Score (0-100) - "More Assets is Better, More Surface Area"
-        # Each asset gives 1.5 pts, each wildcard gives (1.5 * wildcard_mult) ~ 3.75 pts
+        # Concrete hosts count 1 each; wildcards count wildcard_mult each.
+        # (Wildcards are already inside asset_count, so adding wild*mult on
+        # top of the raw count would double-count them.)
         # prefer_large_attack_surface=False flattens every program to neutral 50.
         if not prefer_large_surface:
             surface_score = 50.0
         else:
-            effective_surface = asset_count + (wild_count * wildcard_mult)
+            effective_surface = (asset_count - wild_count) + (
+                wild_count * wildcard_mult
+            )
             if effective_surface >= 40:
                 surface_score = 100.0
             elif effective_surface >= 20:
@@ -2734,16 +3017,18 @@ def evaluate_targets(config=None):
             r["official_start_timestamp"] or r["first_seen_timestamp"] or 0
         )
         if effective_start_ts <= 0:
-            fresh_score = 50.0
+            # Unknown age is low-confidence, not neutral.
+            fresh_score = 25.0
         elif effective_start_ts > new_company_cutoff:
             fresh_score = 100.0
         else:
-            # Still a reasonable program; small bump if seen recently in feed
+            # Known-old programs are stale for freshness purposes; a small
+            # bump only when the feed first observed them recently.
             first_seen_ts = r["first_seen_timestamp"] or 0
             if first_seen_ts > now_ts - 90 * 86400:
                 fresh_score = 65.0
             else:
-                fresh_score = 50.0
+                fresh_score = 25.0
 
         # Freshness bonuses apply only when prefer_fresh_programs is set;
         # the low-competition proxy is additionally gated by low_report_saturation.
@@ -2773,7 +3058,8 @@ def evaluate_targets(config=None):
         # Base from max_payout band. Bugcrowd average_payout adds a real-money bonus
         # when it confirms high actual payouts even on modest max_payout ceilings.
         payout_score = 50.0
-        max_p = r["max_payout"] or 0
+        # Bands are USD: convert first (raw EUR/GBP numbers misrank).
+        max_p = _to_usd(r["max_payout"], r["currency"])
         if max_p > 0:
             if max_p >= 100000:
                 payout_score = 100.0
@@ -2784,8 +3070,10 @@ def evaluate_targets(config=None):
             else:
                 payout_score = 55.0
         elif r["offers_bounties"]:
-            payout_score = 65.0
-        avg_p = r["average_payout"] or 0
+            # Paid but unknown ceiling: low-confidence 30, below any known
+            # ceiling (even a small known one earns 55).
+            payout_score = 30.0
+        avg_p = _to_usd(r["average_payout"], r["currency"])
         if fast_cash:
             if avg_p >= 2000:
                 payout_score = min(100.0, payout_score + 10)
@@ -3208,6 +3496,7 @@ def cmd_check(args):
         FROM assets a
         JOIN programs p ON a.program_id = p.id
         WHERE a.deleted_timestamp=0 AND a.eligible_for_submission=1
+          AND COALESCE(p.deleted_timestamp, 0)=0
     """
     ).fetchall()
     in_scope = [
@@ -3268,6 +3557,60 @@ def cmd_check(args):
         print("   CAUTION: Do not probe without explicit authorization!\n")
 
 
+def _export_blocked_by_oos(cur, program_id, identifier, is_wildcard, cache):
+    """True when emitting this scope rule in a plain list could authorize an
+    explicitly out-of-scope target.
+
+    A plain list cannot express "in scope except X", so export fails closed:
+    an exact OOS match, an asset contained in an OOS rule, and a wildcard
+    asset *touched* by any OOS rule (partial carve) are all suppressed.
+    Exclusions remain available with full fidelity through the DB API.
+    """
+    if program_id not in cache:
+        cache[program_id] = cur.execute(
+            "SELECT asset_identifier, is_wildcard FROM oos_assets "
+            "WHERE program_id=? AND deleted_timestamp=0",
+            (program_id,),
+        ).fetchall()
+    asset_rule, _, asset_wild, asset_ok = canonicalize_asset(
+        identifier, "wildcard" if is_wildcard else "url"
+    )
+    if not asset_ok or not asset_rule:
+        return True  # uncanonicalizable scope must not be emitted
+    asset_is_wild = bool(is_wildcard or asset_wild)
+    for row in cache[program_id]:
+        oos_id, oos_wild_flag = row["asset_identifier"], row["is_wildcard"]
+        oos_rule, _, oos_wild, oos_ok = canonicalize_asset(
+            oos_id, "wildcard" if oos_wild_flag else "url"
+        )
+        if not oos_ok or not oos_rule:
+            continue
+        if asset_rule == oos_rule:
+            return True
+        # Concrete exported asset contained in the OOS rule.
+        if scope_match(identifier, oos_id, oos_wild_flag) or _ip_matches_rule(
+            identifier, oos_id
+        ):
+            return True
+        oos_is_wild = bool(oos_wild_flag or oos_wild)
+        # Concrete OOS host inside the exported wildcard: partial carve.
+        if asset_is_wild and not oos_is_wild and scope_match(
+            oos_id, identifier, is_wildcard
+        ):
+            return True
+        # Wildcard/wildcard overlap on suffix-related bases.
+        if asset_is_wild and oos_is_wild:
+            a_base = asset_rule.lstrip("*").lstrip(".")
+            o_base = oos_rule.lstrip("*").lstrip(".")
+            if (
+                a_base == o_base
+                or a_base.endswith("." + o_base)
+                or o_base.endswith("." + a_base)
+            ):
+                return True
+    return False
+
+
 def cmd_export(args, config):
     # Migrate before ranking (see cmd_filter): evaluate_targets hits migrated
     # columns, so ensure_schema must run first on an older DB.
@@ -3285,9 +3628,10 @@ def cmd_export(args, config):
     # bounty eligibility, so a bounty-ineligible asset never enters the paid
     # target list. VDP (offers_bounties=0) programs need only submission.
     sql = (
-        "SELECT DISTINCT a.asset_identifier FROM assets a"  # nosec B608
+        "SELECT a.asset_identifier, a.program_id, a.is_wildcard FROM assets a"  # nosec B608
         " JOIN programs p ON a.program_id = p.id"
         " WHERE a.deleted_timestamp=0 AND a.eligible_for_submission=1"
+        " AND COALESCE(p.deleted_timestamp, 0)=0"
         " AND (p.offers_bounties=0 OR a.eligible_for_bounty=1)"
         " AND a.program_id IN (" + placeholders + ")"
     )
@@ -3295,8 +3639,15 @@ def cmd_export(args, config):
         sql += " AND a.is_wildcard = 1"
 
     rows = cur.execute(sql, target_ids).fetchall()
+    oos_cache = {}
+    seen = set()
     for r in rows:
         val = r[0].strip()
+        if val in seen:
+            continue
+        if _export_blocked_by_oos(cur, r[1], val, r[2], oos_cache):
+            continue
+        seen.add(val)
         if args.clean:
             val = clean_asset_identifier(val)
         print(val)

@@ -20,6 +20,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import scan4me  # noqa: E402 - import requires the sys.path insert above
 
 
+def test_runtime_paths_are_checkout_relative(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    assert scan4me.DB_PATH == scan4me.REPO_ROOT / "scan4me.db"
+    assert scan4me.CONFIG_PATH == scan4me.REPO_ROOT / "config.json"
+    assert scan4me.CACHE_DATA_DIR == scan4me.REPO_ROOT / "data_cache"
+
+
 # ── scope_match: exact (non-wildcard) ─────────────────────────────────────────
 
 
@@ -999,9 +1006,11 @@ def _seed_scoring_fixture(cur, now):
 
 
 def test_p6_scoring_composite_unchanged(tmp_path, monkeypatch):
-    """Composite scores pinned to values captured before the P6 batching edit.
+    """Composite scores pinned exactly (re-pinned 2026-10 for the
+    low-confidence-unknown and wildcard-surface scoring revisions).
 
-    Any change to the scoring math or the batched new-asset counts breaks this.
+    Any further change to the scoring math or the batched new-asset
+    counts breaks this.
     """
     db_path = tmp_path / "t.db"
     conn = _temp_db(db_path)
@@ -1039,10 +1048,11 @@ def test_p6_scoring_composite_unchanged(tmp_path, monkeypatch):
         (
             "Fast Corp",
             "HackerOne",
-            86.2,
+            # Freshness: known-old base 25 + new-assets bonus 15 = 40.
+            81.2,
             100.0,
             85.0,
-            65.0,
+            40.0,
             85.0,
             27,
             5,
@@ -1065,17 +1075,70 @@ def test_p6_scoring_composite_unchanged(tmp_path, monkeypatch):
         (
             "Small Shop",
             "Intigriti",
-            44.8,
-            50.0,
+            # Unknown speed/freshness/payout are low-confidence (30/25/30),
+            # never average-or-better free points.
+            27.5,
+            30.0,
             25.0,
-            50.0,
-            65.0,
+            25.0,
+            30.0,
             2,
             0,
             0,
             "🔍 NARROW/FOCUSED",
         ),
     ]
+
+
+def test_to_usd_converts_known_currencies_and_rejects_unknown():
+    assert scan4me._to_usd(100, "USD") == 100.0
+    assert scan4me._to_usd(100, "USDC") == 100.0
+    assert scan4me._to_usd(100, "EUR") > 100.0
+    assert scan4me._to_usd(100, "GBP") > scan4me._to_usd(100, "EUR")
+    assert scan4me._to_usd(100, "XYZ") == 0.0
+    assert scan4me._to_usd(0, "EUR") == 0.0
+
+
+def test_evaluate_payout_band_uses_usd(tmp_path, monkeypatch):
+    """EUR 19,000 converts above the USD 20,000 band edge (85, not 70)."""
+    conn = _temp_db(tmp_path / "t.db")
+    pid = _seed_program(conn, "Intigriti", "EuroCo", "euroco")
+    _add_asset(conn, pid, "api.euroco.eu")
+    conn.execute(
+        "UPDATE programs SET max_payout=19000, currency='EUR' WHERE id=?", (pid,)
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(scan4me, "DB_PATH", tmp_path / "t.db")
+    results = scan4me.evaluate_targets(scan4me.load_config())
+    euro = [r for r in results if r["id"] == pid]
+    assert euro and euro[0]["payout_score"] == 85.0
+
+
+def test_evaluate_excludes_ineligible_only_program(tmp_path, monkeypatch):
+    conn = _temp_db(tmp_path / "t.db")
+    pid = _seed_program(conn, "Intigriti", "NoSubmit", "nosubmit")
+    _add_asset(conn, pid, "api.nosubmit.eu", eligible_for_submission=0)
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(scan4me, "DB_PATH", tmp_path / "t.db")
+    ids = {r["id"] for r in scan4me.evaluate_targets(scan4me.load_config())}
+    assert pid not in ids
+
+
+def test_load_config_deep_merges_and_normalizes_weights(tmp_path, monkeypatch):
+    partial = tmp_path / "config.json"
+    partial.write_text(
+        json.dumps({"ranking_weights": {"triage_speed": 2.0}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(scan4me, "CONFIG_PATH", partial)
+    cfg = scan4me.load_config()
+    assert set(cfg["ranking_weights"]) == {
+        "triage_speed", "attack_surface_size",
+        "freshness_and_low_saturation", "payout_size",
+    }
+    assert abs(sum(cfg["ranking_weights"].values()) - 1.0) < 1e-9
+    assert cfg["display"]["limit"] == 25
 
 
 # ── P5: Immunefi + PDPrograms feed repair ─────────────────────────────────────
@@ -1646,7 +1709,7 @@ def test_prioritize_fast_cash_gates_bonuses(tmp_path, monkeypatch):
     cfg["filters"]["payouts"] = {"prioritize_fast_cash": False}
     got = {p["name"]: p for p in _scored_names(cfg, db_path, monkeypatch)}
     assert got["Fast Corp"]["speed_score"] == 100 - 10.0 * 1.5  # no +15
-    assert got["Enriched Inc"]["speed_score"] == 50.0  # no validation bonus
+    assert got["Enriched Inc"]["speed_score"] == 30.0  # unknown base, no bonus
     assert got["Enriched Inc"]["payout_score"] == 70.0  # no avg-payout +5
 
 
@@ -2038,7 +2101,96 @@ def test_cmd_export_migrates_before_ranking(tmp_path, monkeypatch, capsys):
 # ── withdrawn-program reconciliation (Greptile issue 4) ───────────────────────
 
 
+def test_cmd_check_tombstoned_program_not_authorized(tmp_path, monkeypatch, capsys):
+    """A program tombstoned by reconciliation (deleted_timestamp set) must
+    never authorize a target, even though its assets remain stored."""
+    conn = _temp_db(tmp_path / "t.db")
+    pid = _seed_program(conn, "hackerone", "DeadCo", "deadco")
+    _add_asset(conn, pid, "api.deadco.com")
+    conn.execute("UPDATE programs SET deleted_timestamp=999 WHERE id=?", (pid,))
+    out = _run_check(tmp_path, monkeypatch, capsys, conn, "api.deadco.com")
+    assert "AUTHORIZED IN-SCOPE" not in out
+    assert "NOT IN KNOWN SCOPE" in out
 
+
+def test_cmd_export_excludes_tombstoned_program_assets(tmp_path, monkeypatch, capsys):
+    conn = _temp_db(tmp_path / "t.db")
+    live = _seed_program(conn, "hackerone", "LiveCo", "liveco")
+    dead = _seed_program(conn, "hackerone", "DeadCo", "deadco")
+    _add_asset(conn, live, "api.liveco.com")
+    _add_asset(conn, dead, "api.deadco.com")
+    conn.execute("UPDATE programs SET deleted_timestamp=999 WHERE id=?", (dead,))
+    out = _run_export(tmp_path, monkeypatch, capsys, conn, [live, dead])
+    assert "api.liveco.com" in out
+    assert "api.deadco.com" not in out
+
+
+def test_evaluate_targets_excludes_tombstoned_programs(tmp_path, monkeypatch):
+    conn = _temp_db(tmp_path / "t.db")
+    live = _seed_program(conn, "HackerOne", "LiveCo", "liveco")
+    dead = _seed_program(conn, "HackerOne", "DeadCo", "deadco")
+    _add_asset(conn, live, "api.liveco.com")
+    _add_asset(conn, dead, "api.deadco.com")
+    conn.execute("UPDATE programs SET deleted_timestamp=999 WHERE id=?", (dead,))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(scan4me, "DB_PATH", str(tmp_path / "t.db"))
+    cfg = scan4me.load_config()
+    ids = {row["id"] for row in scan4me.evaluate_targets(cfg)}
+    assert live in ids
+    assert dead not in ids
+
+
+def test_reconcile_tombstones_vanished_but_not_on_truncated_feed(tmp_path):
+    conn = _temp_db(tmp_path / "t.db")
+    cur = conn.cursor()
+    keep = _seed_program(conn, "HackerOne", "KeepCo", "keepco")
+    gone = _seed_program(conn, "HackerOne", "GoneCo", "goneco")
+    conn.commit()
+    # Complete feed: vanishing one of two must NOT tombstone (below-half
+    # truncation guard also covers small platforms).
+    n = scan4me._reconcile_platform_programs(cur, "HackerOne", {"keepco"}, 999)
+    assert n == 0
+    # Empty feed must never tombstone.
+    assert scan4me._reconcile_platform_programs(cur, "HackerOne", set(), 999) == 0
+    # Healthy feed (>half present): the one vanished program IS tombstoned.
+    for h in ("alpha", "beta", "gamma", "delta"):
+        _seed_program(conn, "Bugcrowd", h.title(), h)
+    conn.commit()
+    n = scan4me._reconcile_platform_programs(
+        cur, "Bugcrowd", {"alpha", "beta", "gamma"}, 999
+    )
+    assert n == 1
+    dead = conn.execute(
+        "SELECT deleted_timestamp FROM programs WHERE handle='delta'"
+    ).fetchone()[0]
+    assert dead == 999
+    conn.close()
+    assert keep and gone
+
+
+def test_cmd_export_excludes_exact_oos_asset(tmp_path, monkeypatch, capsys):
+    conn = _temp_db(tmp_path / "t.db")
+    pid = _seed_program(conn, "hackerone", "Acme", "acme")
+    _add_asset(conn, pid, "ok.acme.com")
+    _add_asset(conn, pid, "admin.acme.com")
+    _add_oos(conn, pid, "admin.acme.com")
+    out = _run_export(tmp_path, monkeypatch, capsys, conn, [pid])
+    assert "ok.acme.com" in out
+    assert "admin.acme.com" not in out
+
+
+def test_cmd_export_suppresses_wildcard_touched_by_oos(tmp_path, monkeypatch, capsys):
+    """Fail-closed plain export: a wildcard pattern partially carved by an
+    OOS exclusion cannot be represented safely, so it must not be emitted."""
+    conn = _temp_db(tmp_path / "t.db")
+    pid = _seed_program(conn, "hackerone", "Acme", "acme")
+    _add_asset(conn, pid, "*.acme.com", is_wildcard=1)
+    _add_asset(conn, pid, "ok.other.com")
+    _add_oos(conn, pid, "admin.acme.com")
+    out = _run_export(tmp_path, monkeypatch, capsys, conn, [pid])
+    assert "ok.other.com" in out
+    assert not any("acme.com" in line for line in out)
 
 
 
