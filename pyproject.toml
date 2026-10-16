@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scan4me"
+version = "0.1.0"
+description = "Precision bug bounty intelligence and scope targeter"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+# Core is stdlib-only by design; PyYAML is used lazily for one feed shape.
+dependencies = [
+    "PyYAML",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.setuptools]
+py-modules = ["scan4me"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

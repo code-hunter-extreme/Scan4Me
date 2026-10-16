@@ -159,9 +159,9 @@ Tune your hunting criteria:
     "pd_programs": true
   },
   "ranking_weights": {
-    "triage_speed": 0.40,
-    "attack_surface_size": 0.20,
-    "freshness_and_low_saturation": 0.25,
+    "triage_speed": 0.35,
+    "attack_surface_size": 0.30,
+    "freshness_and_low_saturation": 0.20,
     "payout_size": 0.15
   }
 }
