@@ -1,5 +1,5 @@
 {
-  "description": "Scan4Me Hunter Profile — Fast Triage, New Programs/Assets, Low Competition, Fast Cash",
+  "description": "Scan4Me Hunter Profile \u2014 Fast Triage, New Programs/Assets, Low Competition, Fast Cash",
   "api_keys": {
     "_comment": "Set keys here OR export as env vars (env vars take priority, never commit real keys).",
     "hackerone": {
@@ -51,7 +51,7 @@
     "pd_programs": {
       "api_token": null,
       "_env": "PD_PROGRAMS_API_TOKEN",
-      "_doc": "Public GitHub repo — no auth needed. Slot reserved."
+      "_doc": "Public GitHub repo \u2014 no auth needed. Slot reserved."
     }
   },
   "filters": {
@@ -97,16 +97,22 @@
     "bugcrowd": true,
     "intigriti": true,
     "yeswehack": true,
-    "federacy": true,
+    "federacy": false,
     "immunefi": true,
     "sherlock": true,
-    "pd_programs": true
+    "pd_programs": true,
+    "bugbase": true,
+    "hackenproof": true,
+    "cantina": true,
+    "codehawks": true,
+    "patchstack": true,
+    "huntr": true
   },
   "ranking_weights": {
-    "triage_speed": 0.35,
-    "attack_surface_size": 0.30,
-    "freshness_and_low_saturation": 0.20,
-    "payout_size": 0.15
+    "payout_size": 0.35,
+    "attack_surface_size": 0.3,
+    "freshness_and_low_saturation": 0.2,
+    "triage_speed": 0.15
   },
   "display": {
     "limit": 25,

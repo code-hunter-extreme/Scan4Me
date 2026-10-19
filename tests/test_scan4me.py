@@ -1020,6 +1020,12 @@ def test_p6_scoring_composite_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(scan4me, "DB_PATH", db_path)
 
     cfg = _eval_config(hackerone=True, bugcrowd=True, intigriti=True)
+    cfg["ranking_weights"] = {
+        "triage_speed": 0.35,
+        "attack_surface_size": 0.30,
+        "freshness_and_low_saturation": 0.20,
+        "payout_size": 0.15,
+    }
     cfg["filters"]["freshness_and_competition"] = {
         "prefer_new_assets": True,
         "new_asset_days": 30,
@@ -2285,3 +2291,309 @@ def test_strict_new_companies_requires_bugcrowd_official_date(tmp_path, monkeypa
     strict_names = {p["name"] for p in scan4me.evaluate_targets(cfg)}
     assert "BC New" in strict_names
     assert "H1 Obs" not in strict_names, strict_names
+
+
+# ── New Tests: Multi-platform accuracy, Web3 scope, and SLA baseline ──────────
+
+
+def test_web3_programs_not_dropped_when_assets_empty(tmp_path, monkeypatch):
+    """Web3 / Immunefi programs with empty DNS asset tables must not be dropped by min_in_scope_assets."""
+    db_path = tmp_path / "t.db"
+    conn = _temp_db(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO programs (platform, name, handle, url, offers_bounties,
+           max_payout, currency, first_seen_timestamp, last_updated_timestamp,
+           program_kind)
+           VALUES ('Immunefi', 'Web3 Protocol', 'web3-protocol',
+           'https://immunefi.com/bug-bounty/web3-protocol', 1, 1000000.0, 'USD',
+           1000, 1000, 'web3')"""
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(scan4me, "DB_PATH", db_path)
+
+    cfg = _eval_config(immunefi=True)
+    results = scan4me.evaluate_targets(cfg)
+    assert len(results) == 1
+    assert results[0]["name"] == "Web3 Protocol"
+    assert results[0]["payout_score"] == 100.0
+    assert results[0]["surface_score"] == 50.0
+
+
+def test_unmeasured_managed_triage_elevates_to_sla_baseline(tmp_path, monkeypatch):
+    """Unmeasured programs with managed_triage earn the SLA baseline (70.0) when prefer_managed_triage is set."""
+    db_path = tmp_path / "t.db"
+    conn = _temp_db(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO programs (platform, name, handle, url, offers_bounties,
+           managed_triage, max_payout, currency, first_seen_timestamp,
+           last_updated_timestamp, program_kind)
+           VALUES ('Intigriti', 'Managed Corp', 'managed-corp',
+           'https://intigriti.com/managed-corp', 1, 1, 10000, 'USD', 1000, 1000, 'web2')"""
+    )
+    pid = cur.lastrowid
+    cur.execute(
+        "INSERT INTO assets (program_id, asset_identifier, asset_type, is_wildcard) "
+        "VALUES (?, 'api.managed.com', 'URL', 0)", (pid,)
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(scan4me, "DB_PATH", db_path)
+
+    cfg = _eval_config(intigriti=True)
+    cfg["filters"]["fast_triage"]["prefer_managed_triage"] = True
+    results = scan4me.evaluate_targets(cfg)
+    assert len(results) == 1
+    assert results[0]["speed_score"] == 70.0
+
+
+def test_rebalanced_default_ranking_weights():
+    """Verify DEFAULT_CONFIG ranks payout magnitude (0.35) higher than triage speed (0.15)."""
+    cfg = scan4me.load_config()
+    weights = cfg["ranking_weights"]
+    assert weights["payout_size"] == 0.35
+    assert weights["attack_surface_size"] == 0.30
+    assert weights["freshness_and_low_saturation"] == 0.20
+    assert weights["triage_speed"] == 0.15
+
+
+# ── Listing-platform coverage (Bugbase/HackenProof/Cantina/Patchstack/Huntr/CodeHawks/Sherlock BB) ──
+
+
+def test_listing_defaults_cover_required_platforms():
+    plats = scan4me.DEFAULT_CONFIG["platforms"]
+    for key in ("bugbase", "hackenproof", "cantina", "codehawks", "patchstack", "huntr"):
+        assert plats[key] is True, key
+    assert plats["federacy"] is False  # operator: no account, ignore
+    assert "hatsfinance" not in plats  # operator: no account, exclude
+
+
+def test_parse_hackenproof_cards():
+    html = """
+    <a href="/programs/gate"><span>Gate</span><span>Gate</span>
+    <span>Up to:</span><span>$5,000</span><span>Started date:</span>
+    <span>14 Jul 2020</span><span>Submissions:</span><span>526</span></a>
+    <a href="/programs/coinw"><span>Triaged by HackenProof</span><span>CoinW</span>
+    <span>Up to:</span><span>$2,000</span></a>
+    """
+    progs = scan4me._parse_hackenproof_page(html)
+    assert [p["handle"] for p in progs] == ["gate", "coinw"]
+    assert progs[0]["name"] == "Gate" and progs[0]["max_payout"] == 5000.0
+    assert progs[0]["rewarded_vulnerabilities"] == 526
+    assert progs[0]["official_start_timestamp"] is not None
+    assert progs[1]["name"] == "CoinW" and progs[1]["managed_triage"] is True
+
+
+def test_parse_cantina_patchstack_huntr_sherlock_cards():
+    cantina = scan4me._parse_cantina_page(
+        '<a href="/bounties/abc"><img alt="Euler"><span>Euler-Bounty</span>'
+        "<span>7,500,000</span><span>in</span><span>USDC</span><span>Live</span>"
+        "<span>Cantina-Triaged</span><span>Started on 21 Aug 2024</span></a>"
+    )
+    assert cantina[0]["max_payout"] == 7500000.0 and cantina[0]["managed_triage"] is True
+    patch = scan4me._parse_patchstack_page(
+        '<a href="/database/wordpress/plugin/elementor-pro/vulnerabilities">Plugin Elementor Pro</a>'
+    )
+    assert patch[0]["handle"] == "elementor-pro" and patch[0]["name"] == "Elementor Pro"
+    huntr = scan4me._parse_huntr_page(
+        '<a href="/challenges/ABC123/v1/leaderboard" aria-label="View details for Quiet Part challenge">x</a>'
+    )
+    assert huntr[0]["handle"] == "ABC123" and huntr[0]["name"] == "Quiet Part"
+    assert huntr[0]["url"] == "https://huntr.com/challenges/ABC123"
+    sher = scan4me._parse_sherlock_bounties_page(
+        '<a href="/bug-bounties/56"><img alt="Usual Labs"><span>Usual Labs</span>'
+        "<span>Payout</span><span>16,000,000 USDC</span></a>"
+    )
+    assert sher[0]["handle"] == "sherlock-bb-56" and sher[0]["max_payout"] == 16000000.0
+
+
+def test_parse_codehawks_and_bugbase_pages():
+    hawks = scan4me._parse_codehawks_page(
+        '<a href="/c/2026-07-battlechain">BattleChain</a><span>80,000 USDC</span>'
+    )
+    assert hawks[0]["handle"] == "2026-07-battlechain"
+    assert hawks[0]["max_payout"] == 80000.0 and hawks[0]["starts_at"] == "2026-07"
+    bug = scan4me._parse_bugbase_page(
+        r'{"programName":"boAt","programUsername":"boat-lifestyle",'
+        r'"programType":"vdp","isPrivate":false,"isManaged":true,'
+        r'"createdAt":"2022-04-01T00:00:00.000Z","isVisible":true,"maxBounty":500}'
+    )
+    assert bug[0]["handle"] == "boat-lifestyle" and bug[0]["max_payout"] == 500.0
+    assert bug[0]["managed_triage"] is True
+
+
+def test_evaluate_includes_listing_only_zero_asset(tmp_path, monkeypatch):
+    db_path = tmp_path / "t.db"
+    conn = _temp_db(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO programs (platform, name, handle, url, offers_bounties,"
+        " max_payout, program_kind, first_seen_timestamp, last_updated_timestamp)"
+        " VALUES ('Patchstack', 'Elementor Pro', 'elementor-pro',"
+        " 'https://patchstack.com/database/wordpress/plugin/elementor-pro/vulnerabilities',"
+        " 1, 1000, 'web2', 1000, 1000)"
+    )
+    conn.commit(); conn.close()
+    monkeypatch.setattr(scan4me, "DB_PATH", db_path)
+    out = scan4me.evaluate_targets(_eval_config(patchstack=True))
+    assert [p["name"] for p in out] == ["Elementor Pro"]
+    assert out[0]["surface_score"] == 50.0
+
+
+def test_sherlock_bounty_rows_survive_migration_and_evaluate(tmp_path, monkeypatch):
+    db_path = tmp_path / "t.db"
+    conn = _temp_db(db_path)
+    cur = conn.cursor()
+    for handle, name in (("sherlock-1", "Legacy Contest"), ("sherlock-bb-56", "Usual Labs")):
+        cur.execute(
+            "INSERT INTO programs (platform, name, handle, url, offers_bounties,"
+            " max_payout, currency, program_kind, first_seen_timestamp, last_updated_timestamp)"
+            " VALUES ('Sherlock', ?, ?, 'https://audits.sherlock.xyz/bug-bounties/56', 1,"
+            " 16000000, 'USDC', 'web3', 1000, 1000)",
+            (name, handle),
+        )
+    conn.commit()
+    scan4me.migrate_db(conn)
+    conn.commit()
+    rows = conn.execute("SELECT handle FROM programs WHERE platform='Sherlock'").fetchall()
+    assert [r[0] for r in rows] == ["sherlock-bb-56"]
+    assert conn.execute("SELECT count(*) FROM contests WHERE handle='sherlock-1'").fetchone()[0] == 1
+    conn.close()
+    monkeypatch.setattr(scan4me, "DB_PATH", db_path)
+    out = scan4me.evaluate_targets(_eval_config(sherlock=True))
+    assert [p["name"] for p in out] == ["Usual Labs"]
+
+
+def test_listing_zero_payout_resync_preserves_known(tmp_path):
+    conn = _temp_db(tmp_path / "t.db")
+    cur = conn.cursor()
+    prog = {"name": "Gate", "handle": "gate", "url": "https://x/gate",
+            "max_payout": 5000.0, "offers_bounties": True,
+            "program_kind": "web3", "managed_triage": False}
+    scan4me._sync_listing_programs(cur, "HackenProof", [prog], 1000)
+    conn.commit()
+    scan4me._sync_listing_programs(cur, "HackenProof", [dict(prog, max_payout=0.0)], 2000)
+    conn.commit()
+    assert tuple(cur.execute("SELECT max_payout, first_seen_timestamp FROM programs").fetchone()) == (5000.0, 1000)
+    contest = {"name": "BattleChain", "handle": "2026-07-battlechain", "url": "https://x/c",
+               "max_payout": 80000.0, "currency": "USDC", "offers_bounties": True,
+               "status": "LIVE", "starts_at": "2026-07", "ends_at": None, "description": ""}
+    scan4me._sync_listing_contests(cur, "CodeHawks", [contest], 1000)
+    conn.commit()
+    scan4me._sync_listing_contests(cur, "CodeHawks", [dict(contest, max_payout=0.0)], 2000)
+    conn.commit()
+    assert tuple(cur.execute("SELECT max_payout, first_seen_timestamp FROM contests").fetchone()) == (80000.0, 1000)
+
+
+def test_listing_parser_bleed_cases():
+    # Bugbase: record A has no maxBounty; must not inherit record B's 999.
+    bug = scan4me._parse_bugbase_page(
+        r'{"programName":"Alpha","programUsername":"alpha","programType":"vdp",'
+        r'"isPrivate":false,"isManaged":false,"isVisible":true}'
+        r'{"programName":"Beta","programUsername":"beta","programType":"bugbounty",'
+        r'"isPrivate":false,"isManaged":false,"isVisible":true,"maxBounty":999}'
+    )
+    assert [p["max_payout"] for p in bug] == [0.0, 999.0]
+    # CodeHawks: prize belongs to second card only.
+    hawks = scan4me._parse_codehawks_page(
+        '<a href="/c/2026-01-alpha">Alpha</a><span>no prize here</span>'
+        '<a href="/c/2026-02-beta">Beta</a><span>80,000 USDC</span>'
+    )
+    assert [c["max_payout"] for c in hawks] == [0.0, 80000.0]
+    # HackenProof single text node (no span splits).
+    hp = scan4me._parse_hackenproof_page(
+        '<a href="/programs/gate">Gate Up to: $5,000 Started date: 14 Jul 2020 Submissions: 526</a>'
+    )
+    assert hp[0]["name"] == "Gate" and hp[0]["max_payout"] == 5000.0
+    assert hp[0]["rewarded_vulnerabilities"] == 526
+    assert hp[0]["official_start_timestamp"] is not None
+
+
+def test_listing_amount_and_nav_rejection():
+    # Cantina: small incidental $ first must not beat the real USDC bounty.
+    cantina = scan4me._parse_cantina_page(
+        '<a href="/bounties/f9df94db-c7b1-434b-bb06-d1360abdd1be"><img alt="Uni">'
+        "<span>Deposit $50</span><span>$1,000,000</span><span>in</span><span>USDC</span>"
+        "<span>Live</span></a>"
+        '<a href="/bounties/explore">Explore bounties</a>'
+    )
+    assert len(cantina) == 1 and cantina[0]["max_payout"] == 1000000.0
+    # HackenProof: nav anchor without card evidence is skipped.
+    hp = scan4me._parse_hackenproof_page('<a href="/programs/all">All programs</a>')
+    assert hp == []
+    # CodeHawks: undated generic /c/ links are skipped.
+    hawks = scan4me._parse_codehawks_page('<a href="/c/leaderboard">Leaderboard</a>')
+    assert hawks == []
+    # Huntr: generic button text never becomes the challenge name.
+    huntr = scan4me._parse_huntr_page(
+        '<a href="/challenges/ABC12345/v1/rules"><span>View details</span>'
+        "<span>Quiet Part Challenge Card</span></a>"
+    )
+    assert huntr and huntr[0]["name"] != "View details"
+
+
+def test_listing_reverification_fixes():
+    # CodeHawks: two hrefs per card must not shift prizes to neighbours.
+    hawks = scan4me._parse_codehawks_page(
+        '<a href="/c/2026-01-alpha">Alpha</a><span>4,000 USDC</span>'
+        '<a href="/c/2026-01-alpha">View contest</a>'
+        '<a href="/c/2026-02-beta">Beta</a><span>80,000 USDC</span>'
+        '<a href="/c/2026-02-beta">View contest</a>'
+    )
+    by_handle = {c["handle"]: c for c in hawks}
+    assert by_handle["2026-01-alpha"]["max_payout"] == 4000.0
+    assert by_handle["2026-02-beta"]["max_payout"] == 80000.0
+    # Cantina: USDC-adjacent amount beats a larger non-bounty $ figure.
+    cantina = scan4me._parse_cantina_page(
+        '<a href="/bounties/abc"><img alt="Euler"><span>$7,500,000 TVL</span>'
+        "<span>50,000</span><span>in</span><span>USDC</span><span>Live</span></a>"
+    )
+    assert cantina[0]["max_payout"] == 50000.0
+    small = scan4me._parse_cantina_page(
+        '<a href="/bounties/abc"><img alt="Euler"><span>500 USDC</span><span>Live</span></a>'
+    )
+    assert small[0]["max_payout"] == 500.0
+
+
+def test_listing_preservation_and_usdc_prefix(tmp_path):
+    # USDC-prefixed amount form parses.
+    cantina = scan4me._parse_cantina_page(
+        '<a href="/bounties/abc"><img alt="Euler"><span>USDC 7,500,000</span><span>Live</span></a>'
+    )
+    assert cantina[0]["max_payout"] == 7500000.0
+    # Degraded resync preserves offers/managed (programs) and status (contests).
+    conn = _temp_db(tmp_path / "t.db")
+    cur = conn.cursor()
+    prog = {"name": "Gate", "handle": "gate", "url": "https://x/gate",
+            "max_payout": 5000.0, "offers_bounties": True,
+            "program_kind": "web3", "managed_triage": True}
+    scan4me._sync_listing_programs(cur, "HackenProof", [prog], 1000)
+    conn.commit()
+    degraded = dict(prog, max_payout=0.0, offers_bounties=False, managed_triage=False)
+    scan4me._sync_listing_programs(cur, "HackenProof", [degraded], 2000)
+    conn.commit()
+    assert tuple(cur.execute(
+        "SELECT offers_bounties, managed_triage, max_payout FROM programs").fetchone()) == (1, 1, 5000.0)
+    contest = {"name": "Beta", "handle": "2026-02-beta", "url": "https://x/c",
+               "max_payout": 80000.0, "currency": "USDC", "offers_bounties": True,
+               "status": "LIVE", "starts_at": "2026-02", "ends_at": None, "description": ""}
+    scan4me._sync_listing_contests(cur, "CodeHawks", [contest], 1000)
+    conn.commit()
+    scan4me._sync_listing_contests(
+        cur, "CodeHawks", [dict(contest, max_payout=0.0, offers_bounties=False, status="")], 2000)
+    conn.commit()
+    assert tuple(cur.execute(
+        "SELECT offers_bounties, max_payout, status FROM contests").fetchone()) == (1, 80000.0, "LIVE")
+
+
+def test_sherlock_scope_updated_captured():
+    sher = scan4me._parse_sherlock_bounties_page(
+        '<a href="/bug-bounties/227"><img alt="Usual - Fira"><span>Usual - Fira</span>'
+        "<span>Last Updated • Jan 16, 2026</span><span>7,500,000 USDC</span></a>"
+    )
+    assert sher[0]["official_scope_updated_timestamp"] is not None
+    import datetime as _dt
+    assert _dt.datetime.fromtimestamp(
+        sher[0]["official_scope_updated_timestamp"]).year == 2026

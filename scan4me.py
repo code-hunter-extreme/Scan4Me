@@ -20,6 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -36,6 +37,18 @@ PD_PROGRAMS_REPO = "https://github.com/projectdiscovery/public-bugbounty-program
 IMMUNEFI_BOUNTIES_URL = "https://immunefi.com/bug-bounty/"
 # Sherlock audit contest API (Web3 smart contract audit contests — confirmed public, paginated)
 SHERLOCK_API_URL = "https://audits.sherlock.xyz/api/contests"
+# Public listing pages for platforms without a usable researcher listing API.
+# Server-rendered cards are parsed directly; no browser or account needed.
+BUGBASE_PROGRAMS_URL = "https://bugbase.ai/programs"
+HACKENPROOF_PROGRAMS_URL = "https://hackenproof.com/programs"
+CANTINA_OPPORTUNITIES_URL = "https://cantina.xyz/opportunities"
+CODEHAWKS_CONTESTS_URL = "https://codehawks.cyfrin.io/contests"
+PATCHSTACK_VDP_URL = "https://patchstack.com/database/vdp"
+HUNTR_CHALLENGES_URL = "https://huntr.com/challenges"
+SHERLOCK_BOUNTIES_URL = "https://audits.sherlock.xyz/bug-bounties"
+# Listing-only platforms: public cards carry no scope assets. They are
+# indexed for discovery/newness; Oracle deep-dive fetches real scope.
+LISTING_ONLY_PLATFORMS = {"Bugbase", "HackenProof", "Cantina", "Patchstack", "Huntr"}
 
 # ── Authenticated API endpoints ───────────────────────────────────────────────
 # Used when an api_key is configured for the platform; falls back to public feed.
@@ -210,6 +223,16 @@ def _fetch_h1_authenticated(username, api_token):
         for item in items:
             attrs = item.get("attributes", {})
             handle = attrs.get("handle", "")
+            raw_max = (
+                attrs.get("top_bounty_upper_amount")
+                or attrs.get("top_bounty_lower_amount")
+                or attrs.get("max_payout")
+                or 0.0
+            )
+            try:
+                max_payout = float(raw_max)
+            except (ValueError, TypeError):
+                max_payout = 0.0
             programs.append(
                 {
                     "handle": handle,
@@ -218,6 +241,7 @@ def _fetch_h1_authenticated(username, api_token):
                     "website": attrs.get("profile", {}).get("website") or "",
                     "offers_bounties": bool(attrs.get("offers_bounties")),
                     "managed_program": bool(attrs.get("managed_program")),
+                    "max_payout": max_payout,
                     "average_time_to_first_program_response": attrs.get(
                         "average_time_to_first_program_response"
                     ),
@@ -453,16 +477,22 @@ DEFAULT_CONFIG = {
         "bugcrowd": True,
         "intigriti": True,
         "yeswehack": True,
-        "federacy": True,
+        "federacy": False,  # operator has no account — ignored
         "immunefi": True,
         "sherlock": True,
         "pd_programs": True,
+        "bugbase": True,
+        "hackenproof": True,
+        "cantina": True,
+        "codehawks": True,
+        "patchstack": True,
+        "huntr": True,
     },
     "ranking_weights": {
-        "triage_speed": 0.35,
+        "payout_size": 0.35,
         "attack_surface_size": 0.30,
         "freshness_and_low_saturation": 0.20,
-        "payout_size": 0.15,
+        "triage_speed": 0.15,
     },
     "display": {"limit": 25, "show_company_profile": True, "show_assets_sample": True},
 }
@@ -805,13 +835,14 @@ def migrate_db(conn):
         """
     )
 
-    # P6: Sherlock audit contests are not bug-bounty programs. Move any legacy
-    # contest rows out of programs into contests. Idempotent: once moved, no
-    # platform='Sherlock' rows remain in programs and this is a no-op.
+    # P6: Sherlock audit contests are not bug-bounty programs. Move legacy
+    # contest rows (handle 'sherlock-<id>') out of programs into contests.
+    # Bug-bounty rows use handle 'sherlock-bb-<id>' and stay in programs.
     for row in cur.execute(
         """SELECT name, handle, url, offers_bounties, max_payout, currency,
            first_seen_timestamp, last_updated_timestamp
-           FROM programs WHERE platform='Sherlock'"""
+           FROM programs WHERE platform='Sherlock'
+           AND handle NOT LIKE 'sherlock-bb-%'"""
     ).fetchall():
         cur.execute(
             """
@@ -821,14 +852,16 @@ def migrate_db(conn):
             ) VALUES ('Sherlock', ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(platform, handle) DO UPDATE SET
                 name=excluded.name, url=excluded.url,
-                offers_bounties=excluded.offers_bounties,
+                offers_bounties=MAX(COALESCE(contests.offers_bounties, 0), excluded.offers_bounties),
                 max_payout=excluded.max_payout,
                 currency=excluded.currency,
                 last_updated_timestamp=excluded.last_updated_timestamp
             """,
             tuple(row),
         )
-    cur.execute("DELETE FROM programs WHERE platform='Sherlock'")
+    cur.execute(
+        "DELETE FROM programs WHERE platform='Sherlock' AND handle NOT LIKE 'sherlock-bb-%'"
+    )
 
     conn.commit()
 
@@ -1493,6 +1526,345 @@ def _normalize_immunefi_record(item):
     }
 
 
+
+def _fetch_public_html(url):
+    """GET a public listing page as text. Soft-fail: "" on any error."""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; Scan4Me public metadata sync)"},
+        )
+        with urllib.request.urlopen(req, timeout=25) as resp:  # nosec B310
+            return resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        print(f"[!] Listing fetch skipped ({url}): {e}")
+        return ""
+
+
+class _AnchorExtractor(HTMLParser):
+    """Collect anchors as (href, aria-label, text lines incl. img alt)."""
+
+    def __init__(self):
+        super().__init__()
+        self._cur = None
+        self.anchors = []
+
+    def handle_starttag(self, tag, attrs):
+        d = dict(attrs)
+        if tag == "a":
+            self._cur = [d.get("href", ""), d.get("aria-label", ""), []]
+        elif self._cur is not None and tag == "img" and d.get("alt"):
+            self._cur[2].append(d["alt"].strip())
+
+    def handle_data(self, data):
+        if self._cur is not None and data.strip():
+            self._cur[2].append(data.strip())
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._cur is not None:
+            self.anchors.append(tuple(self._cur))
+            self._cur = None
+
+
+def _unique_lines(lines):
+    out = []
+    for line in lines:
+        if line and line not in out:
+            out.append(line)
+    return out
+
+
+def _listing_anchors(html_text, needle):
+    """Unique anchors whose href contains needle: (href, aria, lines)."""
+    parser = _AnchorExtractor()
+    try:
+        parser.feed(html_text or "")
+    except Exception:
+        return []
+    seen, out = set(), []
+    for href, aria, lines in parser.anchors:
+        if needle in href and href not in seen:
+            seen.add(href)
+            out.append((href, aria, _unique_lines(lines)))
+    return out
+
+
+def _money(text, pattern=r"\$([\d,]+(?:\.\d+)?)"):
+    m = re.search(pattern, text or "")
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1).replace(",", ""))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _parse_human_date(value):
+    """'14 Jul 2020' -> epoch seconds (day precision), or None."""
+    try:
+        return int(datetime.strptime(value.strip(), "%d %b %Y").timestamp())
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _listing_record(name, handle, url, max_payout=0.0, kind="web2",
+                    managed=False, offers=None, started=None, rewarded=None,
+                    scope_updated=None):
+    return {
+        "name": name,
+        "handle": handle,
+        "url": url,
+        "max_payout": float(max_payout or 0),
+        "currency": "USD",
+        "offers_bounties": bool(max_payout) if offers is None else bool(offers),
+        "managed_triage": bool(managed),
+        "program_kind": kind,
+        "official_start_timestamp": started,
+        "official_scope_updated_timestamp": scope_updated,
+        "rewarded_vulnerabilities": rewarded,
+    }
+
+
+def _parse_hackenproof_page(html_text):
+    programs = []
+    for href, _aria, lines in _listing_anchors(html_text, "/programs/"):
+        slug = href.rstrip("/").split("/")[-1]
+        managed = any("Triaged by HackenProof" in line for line in lines)
+        names = [l for l in lines if "Triaged by HackenProof" not in l]
+        if not slug or not names:
+            continue
+        text = " | ".join(lines)
+        if slug.lower() in {"all", "explore", "new", "submit", "programs"}:
+            continue  # navigation/footer anchor, not a program card
+        name = re.split(
+            r"\s+(?:Up to:|Started date:|Submissions:|Paid:)", names[0]
+        )[0].strip()
+        started = _parse_human_date(
+            (re.search(r"Started date:\s*\|?\s*(\d{1,2} [A-Za-z]{3} \d{4})", text) or [None, ""])[1]
+        )
+        subs = re.search(r"Submissions:\s*\|?\s*([\d,]+)", text)
+        programs.append(_listing_record(
+            name, slug, f"https://hackenproof.com{href}",
+            _money(text, r"Up to:\s*\|?\s*\$([\d,]+)") or _money(text),
+            kind="web3", managed=managed, started=started,
+            rewarded=int(subs.group(1).replace(",", "")) if subs else None,
+        ))
+    return programs
+
+
+def _cantina_payout(text):
+    text = text or ""
+    usdc = [
+        float(a.replace(",", ""))
+        for a in re.findall(r"([\d,]+(?:\.\d+)?)[\s|]*(?:in[\s|]+)?USDC", text)
+    ]
+    usdc += [
+        float(a.replace(",", ""))
+        for a in re.findall(r"USDC[\s|]*([\d,]+(?:\.\d+)?)", text)
+    ]
+    if usdc:
+        return max(usdc)
+    dollars = [
+        float(a.replace(",", ""))
+        for a in re.findall(r"\$([\d,]+(?:\.\d+)?)", text)
+    ]
+    return max(dollars) if dollars else 0.0
+
+
+def _parse_cantina_page(html_text):
+    programs = []
+    for href, _aria, lines in _listing_anchors(html_text, "/bounties/"):
+        if not lines:
+            continue
+        slug = href.rstrip("/").split("/")[-1]
+        if slug.lower() in {"explore", "all", "bounties", "opportunities", "competitions"}:
+            continue  # navigation/footer anchor, not a bounty card
+        text = " | ".join(lines)
+        payout = _cantina_payout(text)
+        if not (payout > 0 or "Live" in lines or "Bug Bounty" in text):
+            continue  # no bounty-card evidence on this anchor
+        started = _parse_human_date(
+            (re.search(r"Started on (\d{1,2} [A-Za-z]{3} \d{4})", text) or [None, ""])[1]
+        )
+        programs.append(_listing_record(
+            lines[0], href.rstrip("/").split("/")[-1],
+            f"https://cantina.xyz{href}", payout, kind="web3",
+            managed="Cantina-Triaged" in text,
+            offers=("Live" in lines) or payout > 0, started=started,
+        ))
+    return programs
+
+
+def _parse_patchstack_page(html_text):
+    programs = []
+    for href, _aria, lines in _listing_anchors(html_text, "/database/wordpress/"):
+        parts = [p for p in href.split("/") if p]
+        if "vulnerabilities" not in parts or len(parts) < 4:
+            continue
+        slug = parts[-2]
+        names = [l for l in lines if l not in ("Plugin", "Theme")]
+        name = names[-1] if names else slug.replace("-", " ").title()
+        name = re.sub(r"^(Plugin|Theme)\s+", "", name)
+        url = href if href.startswith("http") else f"https://patchstack.com{href}"
+        programs.append(_listing_record(name, slug, url, 0.0, kind="web2", offers=True))
+    return programs
+
+
+def _parse_huntr_page(html_text):
+    programs = []
+    for href, aria, lines in _listing_anchors(html_text, "/challenges/"):
+        parts = [p for p in href.split("/") if p]
+        if len(parts) < 2:
+            continue
+        cid = parts[1]
+        text = " ".join([aria] + lines)
+        m = re.search(r"(?:View details for|View) (.+?) challenge", text)
+        generic = {"view details", "view", "details", "challenges"}
+        candidates = [l for l in lines if l.strip().lower() not in generic]
+        name = (
+            m.group(1).strip()
+            if m and m.group(1).strip().lower() not in generic
+            else (max(candidates, key=len) if candidates else "")
+        )
+        if not name or name.strip().lower() in generic:
+            continue
+        programs.append(_listing_record(
+            name, cid, f"https://huntr.com/challenges/{cid}",
+            _money(text), kind="web2", offers=True,
+        ))
+    return programs
+
+
+def _parse_sherlock_bounties_page(html_text):
+    programs = []
+    for href, _aria, lines in _listing_anchors(html_text, "/bug-bounties/"):
+        bounty_id = href.rstrip("/").split("/")[-1]
+        if not bounty_id.isdigit() or not lines:
+            continue
+        text = " | ".join(lines)
+        upd = re.search(r"Last Updated[^A-Za-z]*([A-Za-z]{3} \d{1,2}, \d{4})", text)
+        scope_updated = None
+        if upd:
+            try:
+                scope_updated = int(
+                    datetime.strptime(upd.group(1), "%b %d, %Y").timestamp()
+                )
+            except ValueError:
+                scope_updated = None
+        programs.append(_listing_record(
+            lines[0], f"sherlock-bb-{bounty_id}",
+            f"https://audits.sherlock.xyz{href}",
+            _money(text, r"([\d,]+(?:\.\d+)?)\s*(?:USDC|USD)"), kind="web3",
+            scope_updated=scope_updated,
+        ))
+    return programs
+
+
+def _strip_tags(fragment):
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", fragment or ""))
+
+
+def _parse_codehawks_page(html_text):
+    contests = []
+    anchors = _listing_anchors(html_text, "/c/")
+    body = html_text or ""
+    first_pos = {}
+    for href, _a, _l in anchors:
+        s = href.rstrip("/").split("/")[-1]
+        pos = body.find(f'href="/c/{s}"')
+        if s and pos >= 0:
+            first_pos[s] = pos
+    ordered = sorted(first_pos.values())
+    for href, _aria, lines in anchors:
+        slug = href.rstrip("/").split("/")[-1]
+        if not lines or not re.match(r"\d{4}-\d{2}-", slug):
+            continue
+        start = first_pos.get(slug)
+        if start is None:
+            window = ""
+        else:
+            later = [p for p in ordered if p > start]
+            end = later[0] if later else len(body)  # last card: no next anchor
+            window = _strip_tags(body[start:end])
+        status = ""
+        for word in ("Live", "Upcoming", "Judging", "Ended"):
+            if word in window:
+                status = word.upper()
+                break
+        m = re.match(r"(\d{4})-(\d{2})-", slug)
+        contests.append({
+            "name": lines[0],
+            "handle": slug,
+            "url": f"https://codehawks.cyfrin.io{href}",
+            "max_payout": _money(window, r"([\d,]+(?:\.\d+)?)\s*USDC"),
+            "currency": "USDC",
+            "offers_bounties": True,
+            "status": status,
+            "starts_at": f"{m.group(1)}-{m.group(2)}" if m else None,
+            "ends_at": None,
+            "description": "",
+        })
+    return contests
+
+
+def _parse_bugbase_page(html_text):
+    """Bugbase embeds escaped JSON records in its Next.js payload."""
+    body = (html_text or "").replace('\\"', '"')
+    programs = []
+    matches = list(re.finditer(r'"programName":"([^"]+)","programUsername":"([^"]+)"', body))
+    for i, m in enumerate(matches):
+        name, username = m.group(1), m.group(2)
+        end = matches[i + 1].start() if i + 1 < len(matches) else min(len(body), m.start() + 8000)
+        chunk = body[m.start():end]
+        if '"isPrivate":true' in chunk or '"isVisible":false' in chunk:
+            continue
+        max_m = re.search(r'"maxBounty":([\d.]+)', chunk)
+        created = re.search(r'"createdAt":"([^"]+)"', chunk)
+        ptype = re.search(r'"programType":"([^"]+)"', chunk)
+        max_payout = float(max_m.group(1)) if max_m else 0.0
+        programs.append(_listing_record(
+            name, username, f"https://bugbase.ai/programs/{username}",
+            max_payout, kind="web2",
+            managed='"isManaged":true' in chunk,
+            offers=(ptype.group(1) == "bugbounty") if ptype else max_payout > 0,
+            started=parse_public_timestamp(created.group(1)) if created else None,
+        ))
+    seen, out = set(), []
+    for p in programs:
+        if p["handle"] not in seen:
+            seen.add(p["handle"])
+            out.append(p)
+    return out
+
+
+def _fetch_bugbase_programs(url=None):
+    return _parse_bugbase_page(_fetch_public_html(url or BUGBASE_PROGRAMS_URL))
+
+
+def _fetch_hackenproof_programs(url=None):
+    return _parse_hackenproof_page(_fetch_public_html(url or HACKENPROOF_PROGRAMS_URL))
+
+
+def _fetch_cantina_programs(url=None):
+    return _parse_cantina_page(_fetch_public_html(url or CANTINA_OPPORTUNITIES_URL))
+
+
+def _fetch_patchstack_programs(url=None):
+    return _parse_patchstack_page(_fetch_public_html(url or PATCHSTACK_VDP_URL))
+
+
+def _fetch_huntr_programs(url=None):
+    return _parse_huntr_page(_fetch_public_html(url or HUNTR_CHALLENGES_URL))
+
+
+def _fetch_sherlock_bounties(url=None):
+    return _parse_sherlock_bounties_page(_fetch_public_html(url or SHERLOCK_BOUNTIES_URL))
+
+
+def _fetch_codehawks_contests(url=None):
+    return _parse_codehawks_page(_fetch_public_html(url or CODEHAWKS_CONTESTS_URL))
+
+
 def _fetch_immunefi_programs(url=None):
     """Fetch the Immunefi bug bounty list from their public board page.
 
@@ -1714,6 +2086,103 @@ def _reconcile_platform_programs(cur, platform, seen_handles, now_ts):
     return len(stale_ids)
 
 
+
+def _sync_listing_programs(cur, platform, programs, now_ts):
+    """Upsert normalized listing records into programs (caller owns txn)."""
+    seen = set()
+    for p in programs:
+        handle = str(p.get("handle") or "")
+        if not handle or not p.get("name") or not p.get("url"):
+            continue
+        seen.add(handle)
+        existing = cur.execute(
+            "SELECT id, first_seen_timestamp FROM programs WHERE platform=? AND handle=?",
+            (platform, handle),
+        ).fetchone()
+        first_seen = existing[1] if existing else now_ts
+        cur.execute(
+            """
+            INSERT INTO programs (
+                platform, name, handle, url, website, offers_bounties, managed_triage,
+                max_payout, currency, program_kind, official_start_timestamp,
+                official_scope_updated_timestamp,
+                rewarded_vulnerabilities, first_seen_timestamp,
+                last_updated_timestamp, deleted_timestamp
+            ) VALUES (?, ?, ?, ?, '', ?, ?, ?, 'USD', ?, ?, ?, ?, ?, ?, 0)
+            ON CONFLICT(platform, handle) DO UPDATE SET
+                name=excluded.name, url=excluded.url,
+                offers_bounties=MAX(COALESCE(programs.offers_bounties, 0), excluded.offers_bounties),
+                managed_triage=MAX(COALESCE(programs.managed_triage, 0), excluded.managed_triage),
+                max_payout=CASE WHEN excluded.max_payout > 0
+                    THEN excluded.max_payout ELSE programs.max_payout END,
+                official_start_timestamp=COALESCE(
+                    excluded.official_start_timestamp, programs.official_start_timestamp),
+                official_scope_updated_timestamp=COALESCE(
+                    excluded.official_scope_updated_timestamp,
+                    programs.official_scope_updated_timestamp),
+                rewarded_vulnerabilities=COALESCE(
+                    excluded.rewarded_vulnerabilities, programs.rewarded_vulnerabilities),
+                last_updated_timestamp=excluded.last_updated_timestamp,
+                deleted_timestamp=0
+            """,
+            (
+                platform, p["name"], handle, p["url"],
+                1 if p.get("offers_bounties") else 0,
+                1 if p.get("managed_triage") else 0,
+                float(p.get("max_payout") or 0),
+                p.get("program_kind") or "web2",
+                p.get("official_start_timestamp"),
+                p.get("official_scope_updated_timestamp"),
+                p.get("rewarded_vulnerabilities"),
+                first_seen, now_ts,
+            ),
+        )
+    _reconcile_platform_programs(cur, platform, seen, now_ts)
+    return len(seen)
+
+
+def _sync_listing_contests(cur, platform, contests, now_ts):
+    """Upsert normalized contest records into contests (caller owns txn)."""
+    seen = 0
+    for p in contests:
+        handle = str(p.get("handle") or "")
+        if not handle or not p.get("name"):
+            continue
+        seen += 1
+        existing = cur.execute(
+            "SELECT id, first_seen_timestamp FROM contests WHERE platform=? AND handle=?",
+            (platform, handle),
+        ).fetchone()
+        first_seen = existing[1] if existing else now_ts
+        cur.execute(
+            """
+            INSERT INTO contests (
+                platform, name, handle, url, offers_bounties, max_payout,
+                currency, status, starts_at, ends_at, description,
+                first_seen_timestamp, last_updated_timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(platform, handle) DO UPDATE SET
+                name=excluded.name, url=excluded.url,
+                offers_bounties=MAX(COALESCE(contests.offers_bounties, 0), excluded.offers_bounties),
+                max_payout=CASE WHEN excluded.max_payout > 0
+                    THEN excluded.max_payout ELSE contests.max_payout END,
+                currency=excluded.currency,
+                status=COALESCE(NULLIF(excluded.status, ''), contests.status), starts_at=excluded.starts_at,
+                ends_at=excluded.ends_at, description=excluded.description,
+                last_updated_timestamp=excluded.last_updated_timestamp
+            """,
+            (
+                platform, p["name"], handle, p.get("url", ""),
+                1 if p.get("offers_bounties") else 0,
+                float(p.get("max_payout") or 0), p.get("currency", "USD"),
+                p.get("status"), _contest_ts(p.get("starts_at")),
+                _contest_ts(p.get("ends_at")), p.get("description"),
+                first_seen, now_ts,
+            ),
+        )
+    return seen
+
+
 def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
     """Sync all enabled feed sources into the local SQLite database.
 
@@ -1874,6 +2343,12 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
                 website = p.get("website") or ""
                 offers_bounty = bool(p.get("offers_bounties"))
                 managed = bool(p.get("managed_program"))
+                max_p = float(
+                    p.get("max_payout")
+                    or p.get("top_bounty_upper_amount")
+                    or p.get("top_bounty")
+                    or 0.0
+                )
                 resp_time = p.get("average_time_to_first_program_response")
                 bounty_time = p.get("average_time_to_bounty_awarded")
                 resolved_time = p.get("average_time_to_report_resolved")
@@ -1894,14 +2369,16 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
                     """
                     INSERT INTO programs (
                         platform, name, handle, url, website, offers_bounties, managed_triage,
+                        max_payout,
                         first_response_hours, bounty_awarded_hours, report_resolved_hours,
                         response_efficiency, currency, submission_state, offers_swag, rules_text,
                         first_seen_timestamp, last_updated_timestamp, deleted_timestamp
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'USD', ?, ?, ?, ?, ?, 0)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'USD', ?, ?, ?, ?, ?, 0)
                     ON CONFLICT(platform, handle) DO UPDATE SET
                         name=excluded.name, url=excluded.url, website=excluded.website,
                         offers_bounties=excluded.offers_bounties,
                         managed_triage=excluded.managed_triage,
+                        max_payout=CASE WHEN excluded.max_payout > 0 THEN excluded.max_payout ELSE programs.max_payout END,
                         first_response_hours=excluded.first_response_hours,
                         bounty_awarded_hours=excluded.bounty_awarded_hours,
                         report_resolved_hours=excluded.report_resolved_hours,
@@ -1921,6 +2398,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
                         website,
                         offers_bounty,
                         managed,
+                        max_p,
                         resp_time,
                         bounty_time,
                         resolved_time,
@@ -2009,7 +2487,9 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
                         name=excluded.name, url=excluded.url,
                         offers_bounties=excluded.offers_bounties,
                         managed_triage=excluded.managed_triage,
-                        max_payout=excluded.max_payout, currency=excluded.currency,
+                        max_payout=CASE WHEN excluded.max_payout > 0
+                    THEN excluded.max_payout ELSE contests.max_payout END,
+                currency=excluded.currency,
                         safe_harbor=excluded.safe_harbor,
                         allows_disclosure=excluded.allows_disclosure,
                         rules_text=CASE WHEN excluded.rules_text != '' THEN excluded.rules_text ELSE programs.rules_text END,
@@ -2256,7 +2736,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
     # 5. Federacy (optional — present in arkadiyt repo but tiny; skip when absent)
     fed_file = local_data_dir / "federacy_data.json"
     fed_data = []
-    if fed_file.exists() and platforms_cfg.get("federacy", True):
+    if fed_file.exists() and platforms_cfg.get("federacy", False):
         with open(fed_file, encoding="utf-8") as f:
             fed_data = json.load(f)
         fed_seen_handles = set()
@@ -2311,7 +2791,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
     elif not fed_file.exists():
         print("[*] Federacy feed not found in repo — skipping.")
     platform_status["federacy"] = _platform_status(
-        platforms_cfg.get("federacy", True) and fed_file.exists(),
+        platforms_cfg.get("federacy", False) and fed_file.exists(),
         fed_data,
         "public-file",
     )
@@ -2555,6 +3035,45 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
             pd_attempted, pd_programs_list, "pd-repo"
         )
 
+    # 9. Public listing platforms (live fetch, soft-fail; Hats/Federacy excluded)
+    _listing_specs = (
+        ("bugbase", "Bugbase", _fetch_bugbase_programs),
+        ("hackenproof", "HackenProof", _fetch_hackenproof_programs),
+        ("cantina", "Cantina", _fetch_cantina_programs),
+        ("patchstack", "Patchstack", _fetch_patchstack_programs),
+        ("huntr", "Huntr", _fetch_huntr_programs),
+        ("sherlock", "Sherlock", _fetch_sherlock_bounties),
+    )
+    for _cfg_key, _label, _fetcher in _listing_specs:
+        _attempted = bool(refresh and platforms_cfg.get(_cfg_key, True))
+        _data = []
+        if _attempted:
+            print(f"[*] Fetching {_label} programs (public listing)...")
+            _data = _fetcher()
+            if _data:
+                with conn:
+                    _sync_listing_programs(cur, _label, _data, now_ts)
+                print(f"[+] {_label} indexed: {len(_data)} programs.")
+            else:
+                print(f"[*] {_label}: no listing data returned.")
+        platform_status[_cfg_key if _cfg_key != "sherlock" else "sherlock_bounties"] = (
+            _platform_status(_attempted, _data, "live-listing")
+        )
+
+    codehawks_contests = []
+    codehawks_attempted = bool(refresh and platforms_cfg.get("codehawks", True))
+    if codehawks_attempted:
+        print("[*] Fetching CodeHawks contests (public listing)...")
+        codehawks_contests = _fetch_codehawks_contests()
+        if codehawks_contests:
+            with conn:
+                _sync_listing_contests(cur, "CodeHawks", codehawks_contests, now_ts)
+            print(f"[+] CodeHawks indexed: {len(codehawks_contests)} contests.")
+    platform_status["codehawks"] = _platform_status(
+        codehawks_attempted, codehawks_contests, "live-listing"
+    )
+
+
     for _plat, _st in ingest_stats.items():
         if _plat in platform_status and _st.get("rejected"):
             platform_status[_plat]["rejected_assets"] = _st["rejected"]
@@ -2737,10 +3256,10 @@ def evaluate_targets(config=None):
     weights = config.get(
         "ranking_weights",
         {
-            "triage_speed": 0.35,
+            "payout_size": 0.35,
             "attack_surface_size": 0.30,
             "freshness_and_low_saturation": 0.20,
-            "payout_size": 0.15,
+            "triage_speed": 0.15,
         },
     )
 
@@ -2755,9 +3274,15 @@ def evaluate_targets(config=None):
         "yeswehack": "YesWeHack",
         "federacy": "Federacy",
         "immunefi": "Immunefi",
-        # P6: Sherlock contests live in the contests table, not programs —
-        # enabling "sherlock" controls contest sync only, never radar rows.
+        # Sherlock bug bounties are programs (sherlock-bb-* handles);
+        # legacy contest handles in programs are excluded in the loop below.
+        "sherlock": "Sherlock",
         "pd_programs": "PDPrograms",
+        "bugbase": "Bugbase",
+        "hackenproof": "HackenProof",
+        "cantina": "Cantina",
+        "patchstack": "Patchstack",
+        "huntr": "Huntr",
     }
     target_plats = [plat_map[p] for p in enabled_plats if p in plat_map]
     if not target_plats:
@@ -2919,8 +3444,21 @@ def evaluate_targets(config=None):
         asset_count = r["asset_count"] or 0
         wild_count = r["wildcard_count"] or 0
 
-        # Scope filters
-        if asset_count < surface_cfg.get("min_in_scope_assets", 1):
+        # Scope filters: Web3 / Immunefi targets don't store DNS assets in assets table
+        r_cols = set(r.keys())
+        p_kind = r["program_kind"] if "program_kind" in r_cols else "web2"
+        p_plat = r["platform"] if "platform" in r_cols else ""
+        is_web3 = bool(p_kind == "web3" or p_plat in ("Immunefi", "Sherlock"))
+        is_listing_only = p_plat in LISTING_ONLY_PLATFORMS
+        if p_plat == "Sherlock" and not str(
+            r["handle"] if "handle" in r_cols else ""
+        ).startswith("sherlock-bb-"):
+            continue  # legacy contest residue, not a bug-bounty program
+        if (
+            not is_web3
+            and not is_listing_only
+            and asset_count < surface_cfg.get("min_in_scope_assets", 1)
+        ):
             continue
 
         # New assets: count official Bugcrowd-dated scope changes; for other platforms
@@ -2946,12 +3484,14 @@ def evaluate_targets(config=None):
         # Bonus tiers come from max_time_to_bounty_awarded_hours (default 336h:
         # <=168h = +15 pts; <=336h = +8 pts); gated by prioritize_fast_cash.
         # Bugcrowd: validation_days <= 7 = +20 pts; <= 14 = +10 pts (fast-cash proxy).
-        # Managed triage earns +5 when prefer_managed_triage is set.
+        # Managed triage earns SLA baseline (70.0) when unmeasured or +5 when measured.
         # No published measurement is LOW-CONFIDENCE 30, not a neutral 50:
         # unknown must never outrank a measured-average program on a guess.
-        speed_score = 30.0
+        speed_score = float(fast_triage.get("unmeasured_speed_score", 30.0))
+        has_speed_telemetry = False
         if r["platform"] == "HackerOne":
             if r["first_response_hours"] is not None:
+                has_speed_telemetry = True
                 speed_score = max(0, 100 - (r["first_response_hours"] * 1.5))
             if fast_cash and r["bounty_awarded_hours"] is not None:
                 if r["bounty_awarded_hours"] <= award_tier1:
@@ -2963,6 +3503,7 @@ def evaluate_targets(config=None):
             and r["platform"] == "Bugcrowd"
             and r["validation_days"] is not None
         ):
+            has_speed_telemetry = True
             # A published validation time IS a measurement: start from the
             # measured-neutral 50, not the unknown 30.
             speed_score = 50.0
@@ -2970,8 +3511,19 @@ def evaluate_targets(config=None):
                 speed_score = min(100.0, speed_score + 20)
             elif r["validation_days"] <= 14:
                 speed_score = min(100.0, speed_score + 10)
-        if prefer_managed and r["managed_triage"]:
-            speed_score = min(100.0, speed_score + 5)
+        elif is_web3:
+            has_speed_telemetry = True
+            speed_score = 65.0
+
+        # Fast triage proxy across all sites without login:
+        # Managed programs have dedicated triage teams with contractual 24-48h SLAs.
+        # When unmeasured, managed status elevates triage speed to SLA baseline (70.0).
+        if "managed_triage" in r_cols and r["managed_triage"]:
+            if not has_speed_telemetry and prefer_managed:
+                managed_baseline = float(fast_triage.get("managed_triage_baseline", 70.0))
+                speed_score = max(speed_score, managed_baseline)
+            elif prefer_managed:
+                speed_score = min(100.0, speed_score + 5)
         speed_score = min(100.0, speed_score)
 
         # 2. Attack Surface Score (0-100) - "More Assets is Better, More Surface Area"
@@ -2980,6 +3532,8 @@ def evaluate_targets(config=None):
         # top of the raw count would double-count them.)
         # prefer_large_attack_surface=False flattens every program to neutral 50.
         if not prefer_large_surface:
+            surface_score = 50.0
+        elif (is_web3 or is_listing_only) and asset_count == 0:
             surface_score = 50.0
         else:
             effective_surface = (asset_count - wild_count) + (
@@ -3858,8 +4412,8 @@ def main():
             "federacy": "⏳ No API yet — slot reserved",
             "immunefi": "🌐 Public board page (no auth needed)",
             "sherlock": "🌐 Public API (no auth needed)",
-            "hackenproof": "⏳ No API detected — slot reserved",
-            "bugbase": "⏳ No API yet — slot reserved",
+            "hackenproof": "🌐 Public listing sync (no auth needed)",
+            "bugbase": "🌐 Public listing sync (no auth needed)",
             "pd_programs": "🌐 Public GitHub repo (no auth needed)",
         }
         for plat, fields in STATUS.items():
