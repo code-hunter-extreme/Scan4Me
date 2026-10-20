@@ -1,6 +1,38 @@
-# Scan4Me — Repair Status (2026-10-08)
+# Scan4Me — Status (2026-10-20)
 
-## Round 1: repair + verify — DONE
+## Current state
+
+- **Tests:** `python3 -m pytest tests/ -q` → **121 passed** (plain run; no wrapper needed).
+- **Live DB (2026-10-19 sync):** 2,027 live programs / 48,699 live assets; 303 contests
+  tracked separately (Sherlock 259 + CodeHawks 44) and excluded from the program radar.
+- **Platforms:** HackerOne, Bugcrowd, Intigriti, YesWeHack, Immunefi, Sherlock
+  (bounties + contests), PDPrograms, plus listing-only discovery feeds (Bugbase,
+  HackenProof, Cantina, Patchstack, Huntr, CodeHawks). Listing-only rows carry
+  **zero fabricated assets**. Federacy off by default; Hats excluded.
+- **Ranking (standalone):** payout 0.35 / surface 0.30 / freshness 0.20 / speed 0.15.
+  Under Oracle, `triage.yaml` overlays this config (payout becomes a gate) — see README.
+- **Lint/type gates are report-only in CI** (`|| true`); pytest + coverage is the hard
+  gate. Do not read older "clean" claims below as current.
+
+## Since Round 1 (2026-10-08)
+
+- Withdrawn-program tombstones + fail-closed export (`d804b6c`).
+- Packaging + hardened CI pytest gate (`424e641`).
+- Multi-platform ranking repair + listing coverage (`078c37a`).
+- Bugcrowd payout sync repair (`programs.max_payout`) + fail-safe bad-data parsing (`a77984e`).
+- Deferred item closed: per-program N+1 asset-count queries replaced with batched GROUP BY.
+
+## Still deferred
+
+- pylint `too-many-*`: split `sync_data` / `evaluate_targets` / `cmd_filter` / `main`.
+- `radar --new-*` with zero matches prints bare "Top 0" (could be friendlier).
+- Bare `float()` remains in a few pre-existing authenticated fetchers (Bugcrowd/Intigriti/
+  YesWeHack) and `_normalize_weights`; listing/public paths are fail-safe.
+
+---
+
+## Round 1: repair + verify — DONE (2026-10-08, historical)
+
 Scope: all 11 approved fixes + new tests. CLI `--new-*` flags now imply strict.
 
 ### Fixes
@@ -27,23 +59,10 @@ Scope: all 11 approved fixes + new tests. CLI `--new-*` flags now imply strict.
 - Live CLI: `evil8x8.com` + `8x8.com.evil.com` → NOT IN SCOPE;
   `foo.8x8.com` → AUTHORIZED via `*.8x8.com`; radar/export/strict/`--no-show-assets` OK.
 
-### How to run tests on this machine
-Plain `python3 -m pytest` crashes here: AI_DRIVE `.pth` entries plus an EIO-bad
-dir (`.../CodeCrusher/robotruth/robotruth/src`) kill any full `sys.path` walk.
-Prune first (Scan4Me needs stdlib only):
-
-```bash
-cd Scan4Me && python3 -c "import sys; sys.path=[p for p in sys.path if 'AI_DRIVE' not in p]; import pytest; raise SystemExit(pytest.main(['tests/','-q']))"
-```
-
-Same prune needed for direct CLI runs (see `/tmp/s4m.py` wrapper pattern).
-Environment issue, not a code issue. Drive health check recommended (`dmesg`).
-
 ### Deferred (known, not this round)
 - pylint `too-many-*`: split `sync_data` / `evaluate_targets` / `cmd_filter` / `main`.
 - Per-program N+1 asset-count queries.
 - `radar --new-*` with zero matches prints bare "Top 0" (could be friendlier).
 
 ### Snapshots
-- BEFORE: `scan4me_BEFORE_20261008.tar.gz`
-- AFTER: `scan4me_AFTER_20261008.tar.gz`
+- (2026-10-08 tarballs referenced at the time are no longer in this repo.)

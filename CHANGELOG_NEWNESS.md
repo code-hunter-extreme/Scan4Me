@@ -1,6 +1,6 @@
 # Changelog: Newness Tracking Implementation
 
-> **Correction (2026-10-08):** These timestamps currently mean first observed by Scan4Me, not official program launch or asset-addition dates. The initial feed snapshot is now recorded as a baseline, and CLI newness filters are wired into radar/export. The imported feeds do not provide resolved-report counts; average resolution time is not a count. Official platform date/history adapters are not yet implemented, so do not treat these filters as proof that a program or asset is newly launched/added.
+> **Correction (2026-10-08, superseded in part 2026-10-20):** Feed `first_seen` timestamps mean first observed by Scan4Me and serve only as a scoring fallback. The initial feed snapshot is recorded as a baseline. Official date/history adapters **are now implemented for Bugcrowd** (`enrich_bugcrowd_program`: published program start dates + versioned scope history): strict newness gates and the NEW badge use those official dates. The imported feeds do not provide resolved-report counts; average resolution time is not a count.
 
 ## Summary
 Added comprehensive newness tracking and filtering to Scan4Me for identifying fresh bug bounty opportunities. This enables rapid prioritization of new programs and newly discovered assets within established programs.
@@ -25,11 +25,10 @@ Added comprehensive newness tracking and filtering to Scan4Me for identifying fr
   - Sets `last_updated_timestamp` on every sync
 
 - `evaluate_targets()`:
-  - When `prefer_new_companies: true`, filters to programs < `new_company_days` old
-  - When `prefer_new_assets: true`, calculates `new_assets_count` for display
+  - `prefer_new_companies` / `prefer_new_assets` are **scoring-only** by themselves. The hard filters are `strict_new_companies` / `strict_new_assets` (official Bugcrowd dates only); CLI `--new-companies` / `--new-assets` imply strict. (Updated 2026-10-20; this changelog originally conflated prefer with filter.)
 
 - `cmd_filter()`:
-  - Displays 🆕 NEW badge for programs < 90 days old (configurable)
+  - Displays the 🆕 NEW PROGRAM badge for programs whose **official** start date (`official_start_ts`) is within the configured window — never from feed first-seen alone
   - Shows `✨ New Assets (Xd): Y` when `prefer_new_assets: true`
 
 #### CLI Enhancements
@@ -42,16 +41,20 @@ Added comprehensive newness tracking and filtering to Scan4Me for identifying fr
 - `export` command:
   - `--new-companies`: Filter exports to new programs
   - `--new-company-days`: Customize threshold
+  - (Added later) `--new-assets` / `--new-asset-days` / `--max-validation-days` / `--max-rewarded-vulnerabilities`
 
 ### 2. Configuration Updates (`config.json`)
 
 Added to `filters.freshness_and_competition`:
 ```json
 {
-  "prefer_new_companies": false,
+  "prefer_new_companies": true,
   "new_company_days": 90,
-  "prefer_new_assets": false,
-  "new_asset_days": 30
+  "strict_new_companies": false,
+  "prefer_new_assets": true,
+  "new_asset_days": 30,
+  "strict_new_assets": false,
+  "max_rewarded_vulnerabilities": 150
 }
 ```
 
@@ -72,8 +75,7 @@ Comprehensive guide covering:
 ## Testing Results
 
 ✅ Schema migration works on existing databases
-✅ All 940 programs synced with timestamps
-✅ All 47,372 assets synced with timestamps
+✅ Program/asset syncs carry timestamps (snapshot at the time: 940 programs / 47,372 assets; live 2026-10-19: 2,027 programs / 48,699 assets)
 ✅ CLI flags parse and apply correctly
 ✅ Radar display shows 🆕 NEW badges
 ✅ Export filtering works with newness flags
@@ -108,7 +110,7 @@ python3 scan4me.py radar --limit 20
 
 ## Future Considerations
 - Webhook notifications for newly discovered high-payout programs
-- Ranking boost for programs with new assets
+- Ranking boost for programs with new assets — **implemented** (freshness bonuses: +15 new-asset / +10 new-company)
 - Asset change detection and alerts
 - Integration with OmniCLI for automatic analysis pipeline
 - Report saturation tracking over time

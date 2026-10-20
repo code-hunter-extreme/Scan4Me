@@ -14,16 +14,19 @@ Scan4Me now enriches Bugcrowd programs from their public metadata endpoints with
 In `config.json`, the `freshness_and_competition` section now includes:
 ```json
 {
-  "prefer_new_companies": false,
+  "prefer_new_companies": true,
   "new_company_days": 90,
-  "prefer_new_assets": false,
-  "new_asset_days": 30
+  "strict_new_companies": false,
+  "prefer_new_assets": true,
+  "new_asset_days": 30,
+  "strict_new_assets": false,
+  "max_rewarded_vulnerabilities": 150
 }
 ```
 
-Toggle these to prioritize newly discovered opportunities:
-- `prefer_new_companies: true` → filters to Bugcrowd programs with an official start date within N days
-- `prefer_new_assets: true` → filters to Bugcrowd programs with an asset first listed in dated scope history within N days
+Prioritization vs hard filtering are different switches:
+- `prefer_new_companies` / `prefer_new_assets: true` → **scoring boost only** (freshness bonus), no exclusion
+- `strict_new_companies` / `strict_new_assets: true` → **hard filter** to Bugcrowd programs whose official start date / dated scope-history asset additions fall within N days. Strict gates require `platform = 'Bugcrowd'` official dates; listing feeds may store `official_start_timestamp` for badge/freshness scoring, but strict remains Bugcrowd-only
 - `new_company_days`: Threshold for "new" classification (default: 90 days)
 - `new_asset_days`: Threshold for asset freshness (default: 30 days)
 
@@ -43,7 +46,7 @@ python3 scan4me.py radar --limit 20
 # Show Bugcrowd programs officially started in the last 90 days
 python3 scan4me.py radar --limit 20 --new-companies
 
-# Show only targets added in last 30 days
+# Show only Bugcrowd targets officially started in the last 30 days
 python3 scan4me.py radar --limit 20 --new-companies --new-company-days 30
 
 # Show Bugcrowd programs with officially added assets in the last 30 days
@@ -53,6 +56,9 @@ python3 scan4me.py radar --limit 20 --new-assets
 #### Export Command
 ```bash
 python3 scan4me.py export --top 30 [--new-companies] [--new-company-days 90]
+                                    [--new-assets] [--new-asset-days 30]
+                                    [--max-validation-days N]
+                                    [--max-rewarded-vulnerabilities N]
                                     [--wildcards-only] [--clean]
 ```
 
@@ -66,13 +72,9 @@ python3 scan4me.py export --top 100 --new-companies --new-company-days 60
 ```
 
 ### 4. Radar Display Enhancements
-- **🆕 NEW TO FEED Badge**: Displayed for programs first observed within the configured window
-- **✨ New Assets Count**: Shows count of newly discovered assets when `--new-assets` is active
-- Example:
-  ```
-  [01] ★ SCORE: 92.8/100 | 🔥 MASSIVE SURFACE | [HackerOne] TikTok 🆕 NEW
-       ✨ New Assets (30d): 5 first observed since baseline
-  ```
+- **🆕 NEW PROGRAM Badge**: Displayed only when the program's **official** start date (`official_start_ts`) falls within the configured window. Feed first-observation alone never earns the badge.
+- **✨ New Assets Count**: Counts assets whose `official_first_seen_timestamp` (falling back to feed `first_seen_timestamp`) falls within N days — for **all** platforms, not only Bugcrowd scope history. The display line still labels every platform "(Bugcrowd history)" (a known label imprecision in code; only the strict gates are Bugcrowd-official-only).
+- (Earlier editions of this doc showed a `[HackerOne] … 🆕 NEW` example "first observed since baseline" — that output is impossible under current code and has been removed.)
 
 ### 5. Official Bugcrowd Metadata
 - Run `python3 scan4me.py enrich --limit 30` to fetch public program history and statistics for top-paying Bugcrowd programs.
@@ -84,7 +86,7 @@ python3 scan4me.py export --top 100 --new-companies --new-company-days 60
 - `python3 scan4me.py sync` refreshes the upstream feed before ingestion; `--offline` uses the cached snapshot.
 - The first successful sync establishes a baseline and marks existing programs/assets as unknown/not-new.
 - Later additions receive first-observed feed timestamps; unchanged entries retain their timestamp.
-- Removed assets are removed from the current scope during reconciliation.
+- Removed assets are **tombstoned** (`deleted_timestamp`) during reconciliation, not deleted; live queries filter tombstones out.
 
 ## Workflow: Fast Money Triage
 
@@ -107,7 +109,7 @@ python3 scan4me.py export --top 100 --new-companies --new-company-days 60
    ```
    → Focuses on companies with the most recently discovered scope
 
-4. Confirm every candidate against its live program policy before any testing. Scan4Me's newness timestamps reflect feed observation, not official launch/history dates.
+4. Confirm every candidate against its live program policy before any testing. Strict gates and the badge use official Bugcrowd dates; feed `first_seen` timestamps are only a scoring fallback and never prove launch/addition dates on their own.
 
 ## Database Backward Compatibility
 - If an existing `scan4me.db` lacks timestamp columns, `migrate_db()` automatically adds them
@@ -132,6 +134,6 @@ python3 scan4me.py export --help
 python3 scan4me.py radar --limit 5 --new-companies
 python3 scan4me.py export --top 10 --new-companies --clean
 
-# Check database timestamps
+# Check database timestamps (baseline rows read 0 = observed before tracking; that is expected, not missing data)
 sqlite3 scan4me.db "SELECT name, first_seen_timestamp FROM programs LIMIT 5;"
 ```

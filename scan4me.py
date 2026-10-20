@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
 Scan4Me: Precision Bug Bounty Intelligence & Scope Targeter
-Filters 47,000+ assets across HackerOne, Bugcrowd, Intigriti, and YesWeHack
-for paid program discovery, scope size, available response-time measurements,
-and first-observed changes in the imported feeds.
+Filters tens of thousands of assets across HackerOne, Bugcrowd, Intigriti,
+YesWeHack, Immunefi, Sherlock, PDPrograms, and listing-only discovery feeds
+(Bugbase, HackenProof, Cantina, Patchstack, Huntr, CodeHawks) for paid
+program discovery, scope size, available response-time measurements, and
+first-observed changes in the imported feeds. Standalone ranking uses this
+repo's config.json; under Oracle, triage.yaml overlays it (see README).
 """
 
 import argparse

@@ -6,7 +6,9 @@
 3. **💰 Fast Cash & High Payouts**: Strict filtering for paid BBP programs and verified bounty pools.
 4. **🆕 Official Program/Scope History**: Bugcrowd enrichment reads published program start dates and versioned scope history. Other feeds are not labeled with official dates until platform-specific adapters are added.
 
-It indexes programs and assets from **HackerOne**, **Bugcrowd**, **Intigriti**, **YesWeHack**, and **Federacy** (core feeds), plus **Sherlock** (live contest API) and the projectdiscovery public-bugbounty-programs scope feed (`PDPrograms`). Bugcrowd public statistics include rewarded-vulnerability totals, historical average payout, and validation time; those are useful competition/triage signals, but rewarded totals are not counts of open or resolved reports.
+It indexes programs and assets from **HackerOne**, **Bugcrowd**, **Intigriti**, **YesWeHack**, **Immunefi**, **Sherlock** (contests plus bug bounties) and the projectdiscovery public-bugbounty-programs scope feed (`PDPrograms`), plus listing-only discovery feeds for **Bugbase**, **HackenProof**, **Cantina**, **Patchstack**, **Huntr**, and **CodeHawks** contests. Listing-only platforms are discovery-only: **zero assets are ever fabricated for them** — they enter rankings with a neutral surface score until a real source provides scope. **Federacy is off by default** and **Hats Finance is excluded** (no accounts). Contests (Sherlock/CodeHawks) are tracked separately from programs and never enter the program radar. Last full live sync (2026-10-19): **2,027 programs / 48,699 assets** (HackerOne 449, Bugcrowd 298, Intigriti 144, YesWeHack 56, Immunefi 157, PDPrograms 802, Bugbase 20, HackenProof 19, Cantina 10, Patchstack 28, Huntr 4, Sherlock bounties 39, plus 1 legacy Federacy row predating its default-off; 303 contests tracked separately). Bugcrowd public statistics include rewarded-vulnerability totals, historical average payout, and validation time; those are useful competition/triage signals, but rewarded totals are not counts of open or resolved reports.
+
+> **Shared configuration with Oracle:** standalone Scan4Me ranking uses this repo's `config.json`. When driven by Oracle (`oracle_hunter.py prescan/scan`), Oracle's `triage.yaml` is the boss profile: `oracle_scan4me.triage_prescan_overlay()` maps it over Scan4Me's config, payout becomes a hard gate rather than a rank weight, and strict newness gates are forced off at prescan (signed-in stages re-measure). Tune `triage.yaml` for Oracle-driven runs, `config.json` for standalone runs — not the other way around.
 
 ---
 
@@ -15,27 +17,28 @@ It indexes programs and assets from **HackerOne**, **Bugcrowd**, **Intigriti**, 
 ```mermaid
 flowchart TD
     subgraph DATA_SOURCES["1. Continuous Data Ingestion"]
-        H1["HackerOne Feed\n(450 Programs)"]
-        BC["Bugcrowd Feed\n(291 Programs)"]
+        H1["HackerOne Feed\n(449 Programs)"]
+        BC["Bugcrowd Feed\n(298 Programs)"]
         INTI["Intigriti Feed\n(144 Programs)"]
         YWH["YesWeHack Feed\n(56 Programs)"]
-        FED["Federacy Feed"]
-        SHER["Sherlock Feed\n(live API)"]
-        PD["PDPrograms Scope Feed"]
+        IMM["Immunefi Feed\n(157 Programs)"]
+        LIST["Listing Feeds\nBugbase/HackenProof/Cantina/Patchstack/Huntr (discovery-only)"]
+        SHER["Sherlock Feed\n(bounties + contests)"]
+        PD["PDPrograms Scope Feed\n(802 Programs)"]
     end
 
     subgraph ENGINE["2. Normalization & Scoring Core (Scan4Me)"]
         PARSE["Scope & Company Extractor\n(Name, Website, Policy URL, Safe Harbor)"]
-        SURFACE["Surface Area Calculator\n(Assets + Wildcards * Multiplier)"]
+        SURFACE["Surface Area Calculator\n((Assets - Wildcards) + Wildcards * Multiplier)"]
         TRIAGE["SLA Triage Analyzer\n(Response Time & Efficiency %)"]
-        SCORE["Composite Fast-Money Algorithm\n(Speed 35% • Surface 30% • Freshness 20% • Payout 15%)"]
+        SCORE["Composite Fast-Money Algorithm\n(Payout 35% • Surface 30% • Freshness 20% • Speed 15%)"]
     end
 
     subgraph CONFIG["3. User Hunter Config (config.json)"]
-        CFG_SPEED["fast_triage.max_first_response_hours: 48h"]
-        CFG_SURF["attack_surface.prefer_large_attack_surface: true"]
-        CFG_WILD["attack_surface.wildcard_multiplier: 2.5x"]
-        CFG_PAID["payouts.paid_bounties_only: true"]
+        CFG_SPEED["fast_triage.max_first_response_hours: 24h"]
+        CFG_SURF["attack_surface_and_scope.prefer_large_attack_surface: true"]
+        CFG_WILD["attack_surface_and_scope.wildcard_multiplier: 2.5x"]
+        CFG_PAID["filters.paid_bounties_only: true"]
     end
 
     subgraph OUTPUT["4. High-Impact White-Hat Operations"]
@@ -70,9 +73,15 @@ For offline operation against the last cached snapshot:
 python3 scan4me.py sync --offline
 ```
 
-The first sync establishes an observation baseline. Use the enrichment command for Bugcrowd's actual program and scope dates:
+The first sync establishes an observation baseline. Use the enrichment command for Bugcrowd's actual program and scope dates (default `--limit 10`; `--delay` paces requests):
 ```bash
 python3 scan4me.py enrich --limit 30
+```
+
+Authenticated platform feeds are opt-in per sync (`--use-auth` / `"use_auth": true`; per-feed skips exist for only 4 feeds: `--no-immunefi`, `--no-sherlock`, `--no-pd-programs`, `--no-federacy`) and fail soft to public data structure (never silently to wrong data):
+```bash
+python3 scan4me.py keys            # show which API keys are configured (masked)
+python3 scan4me.py sync --use-auth # official APIs where keys exist
 ```
 
 ### 2. Run Precision Target Radar
@@ -88,7 +97,7 @@ python3 scan4me.py radar --new-assets --new-asset-days 30
 python3 scan4me.py radar --max-validation-days 14 --max-rewarded-vulnerabilities 100
 ```
 
-`--new-companies` and `--new-assets` currently use official Bugcrowd start/scope history; platforms without an implemented source adapter are excluded by those filters rather than guessed. `--max-validation-days` uses Bugcrowd's published validation statistic. `--max-rewarded-vulnerabilities` is a historical competition proxy, not a resolved-report count. Use `--require-measured-triage` to require HackerOne first-response data or Bugcrowd validation data.
+`--new-companies` and `--new-assets` currently use official Bugcrowd start/scope history; platforms without an implemented source adapter are excluded by those filters rather than guessed. `--max-validation-days` uses Bugcrowd's published validation statistic; in non-strict mode, unenriched Bugcrowd programs and all non-Bugcrowd programs pass through rather than being excluded — set `strict_validation_days` for a hard gate. `--max-rewarded-vulnerabilities` is a historical competition proxy with the same non-strict pass-through, not a resolved-report count. Use `--require-measured-triage` to require HackerOne first-response data or Bugcrowd validation data. `sync` also accepts `--use-auth` / `--no-auth` and per-feed `--no-*` switches; check configured credentials with `python3 scan4me.py keys`.
 
 ### 3. Verify Legal Scope Before Probing
 Check whether a target URL or domain is legally authorized:
@@ -153,16 +162,22 @@ Tune your hunting criteria:
     "bugcrowd": true,
     "intigriti": true,
     "yeswehack": true,
-    "federacy": true,
+    "federacy": false,
     "immunefi": true,
     "sherlock": true,
-    "pd_programs": true
+    "pd_programs": true,
+    "bugbase": true,
+    "hackenproof": true,
+    "cantina": true,
+    "codehawks": true,
+    "patchstack": true,
+    "huntr": true
   },
   "ranking_weights": {
-    "triage_speed": 0.35,
+    "payout_size": 0.35,
     "attack_surface_size": 0.30,
     "freshness_and_low_saturation": 0.20,
-    "payout_size": 0.15
+    "triage_speed": 0.15
   }
 }
 ```
