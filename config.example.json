@@ -1,4 +1,6 @@
 {
+  "use_auth": false,
+  "_use_auth_doc": "false (default): unauthenticated public feeds. true (or sync --use-auth): authenticated platform APIs using the keys below. sync --no-auth forces public feeds.",
   "description": "Scan4Me Hunter Profile \u2014 Fast Triage, New Programs/Assets, Low Competition, Fast Cash",
   "api_keys": {
     "_comment": "Set keys here OR export as env vars (env vars take priority, never commit real keys).",

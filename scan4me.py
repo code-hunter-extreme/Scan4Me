@@ -10,6 +10,7 @@ import argparse
 import base64
 import ipaddress
 import json
+import math
 import os
 import re
 import shutil
@@ -517,6 +518,33 @@ def _to_usd(amount, currency) -> float:
         return 0.0
     rate = _FX_TO_USD.get(str(currency or "USD").strip().upper())
     return value * rate if rate else 0.0
+
+
+def _coerce_bool(value, default=False):
+    """Strict config boolean: quoted false/0/no/off never enable."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    if isinstance(value, (int, float)):
+        return math.isfinite(float(value)) and value != 0
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("1", "true", "yes", "on"):
+            return True
+        if v in ("", "0", "false", "no", "off"):
+            return False
+        return bool(default)
+    return bool(default)
+
+
+def _safe_non_negative_float(value) -> float:
+    """Feed numeric guard: bad/non-finite/negative payouts become 0."""
+    try:
+        out = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return out if math.isfinite(out) and out > 0 else 0.0
 
 
 def _deep_merge(base, override):
@@ -1614,9 +1642,11 @@ def _listing_record(name, handle, url, max_payout=0.0, kind="web2",
         "name": name,
         "handle": handle,
         "url": url,
-        "max_payout": float(max_payout or 0),
+        "max_payout": _safe_non_negative_float(max_payout),
         "currency": "USD",
-        "offers_bounties": bool(max_payout) if offers is None else bool(offers),
+        "offers_bounties": _safe_non_negative_float(max_payout) > 0
+        if offers is None
+        else bool(offers),
         "managed_triage": bool(managed),
         "program_kind": kind,
         "official_start_timestamp": started,
@@ -1821,7 +1851,7 @@ def _parse_bugbase_page(html_text):
         max_m = re.search(r'"maxBounty":([\d.]+)', chunk)
         created = re.search(r'"createdAt":"([^"]+)"', chunk)
         ptype = re.search(r'"programType":"([^"]+)"', chunk)
-        max_payout = float(max_m.group(1)) if max_m else 0.0
+        max_payout = _safe_non_negative_float(max_m.group(1)) if max_m else 0.0
         programs.append(_listing_record(
             name, username, f"https://bugbase.ai/programs/{username}",
             max_payout, kind="web2",
@@ -2038,8 +2068,12 @@ def _row_last_updated(existing, now_ts, refresh_ok):
         return now_ts
 
 
-def _platform_status(enabled, data, source, auth_used=False):
+def _platform_status(enabled, data, source, auth_used=False, count=None):
     """sync_metadata status entry for one platform feed (a staleness tripwire)."""
+    if count is not None and (
+        isinstance(count, bool) or not isinstance(count, int) or count < 0
+    ):
+        raise ValueError(f"platform status count must be an int >= 0, got {count!r}")
     if not enabled:
         return {"status": "skipped", "count": 0, "source": None}
     if not data:
@@ -2052,7 +2086,27 @@ def _platform_status(enabled, data, source, auth_used=False):
                 " old rows left untouched",
             }
         return {"status": "empty", "count": 0, "source": source}
-    return {"status": "ok", "count": len(data), "source": source}
+    effective_count = len(data) if count is None else count
+    if effective_count == 0:
+        if auth_used:
+            return {
+                "status": "auth_empty",
+                "count": 0,
+                "source": source,
+                "note": "authenticated fetch returned rows but none were indexed;"
+                " old rows left untouched",
+            }
+        return {
+            "status": "empty",
+            "count": 0,
+            "source": source,
+            "note": "fetch returned rows but none were indexed",
+        }
+    return {
+        "status": "ok",
+        "count": effective_count,
+        "source": source,
+    }
 
 
 def _reconcile_platform_programs(cur, platform, seen_handles, now_ts):
@@ -2129,7 +2183,7 @@ def _sync_listing_programs(cur, platform, programs, now_ts):
                 platform, p["name"], handle, p["url"],
                 1 if p.get("offers_bounties") else 0,
                 1 if p.get("managed_triage") else 0,
-                float(p.get("max_payout") or 0),
+                _safe_non_negative_float(p.get("max_payout")),
                 p.get("program_kind") or "web2",
                 p.get("official_start_timestamp"),
                 p.get("official_scope_updated_timestamp"),
@@ -2174,7 +2228,7 @@ def _sync_listing_contests(cur, platform, contests, now_ts):
             (
                 platform, p["name"], handle, p.get("url", ""),
                 1 if p.get("offers_bounties") else 0,
-                float(p.get("max_payout") or 0), p.get("currency", "USD"),
+                _safe_non_negative_float(p.get("max_payout")), p.get("currency", "USD"),
                 p.get("status"), _contest_ts(p.get("starts_at")),
                 _contest_ts(p.get("ends_at")), p.get("description"),
                 first_seen, now_ts,
@@ -2215,9 +2269,9 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
     # Default: unauthenticated public scan unless use_auth is explicitly True
     # or no public feed file exists for an enabled platform when refresh=True.
     auth_enabled = (
-        bool(use_auth)
+        _coerce_bool(use_auth)
         if use_auth is not None
-        else bool((loaded_cfg or {}).get("use_auth", False))
+        else _coerce_bool((loaded_cfg or {}).get("use_auth", False))
     )
     CACHE_DATA_DIR.mkdir(parents=True, exist_ok=True)
     repo_dir = CACHE_DATA_DIR / "repo"
@@ -2343,7 +2397,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
                 website = p.get("website") or ""
                 offers_bounty = bool(p.get("offers_bounties"))
                 managed = bool(p.get("managed_program"))
-                max_p = float(
+                max_p = _safe_non_negative_float(
                     p.get("max_payout")
                     or p.get("top_bounty_upper_amount")
                     or p.get("top_bounty")
@@ -2461,7 +2515,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
                 handle = url.rstrip("/").split("/")[-1]
                 if handle:
                     bc_seen_handles.add(str(handle))
-                max_p = float(p.get("max_payout", 0) or 0)
+                max_p = _safe_non_negative_float(p.get("max_payout"))
                 offers_bounty = max_p > 0
                 managed = bool(p.get("managed_by_bugcrowd"))
                 safe = p.get("safe_harbor", "Standard")
@@ -2488,8 +2542,8 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
                         offers_bounties=excluded.offers_bounties,
                         managed_triage=excluded.managed_triage,
                         max_payout=CASE WHEN excluded.max_payout > 0
-                    THEN excluded.max_payout ELSE contests.max_payout END,
-                currency=excluded.currency,
+                            THEN excluded.max_payout ELSE programs.max_payout END,
+                        currency=excluded.currency,
                         safe_harbor=excluded.safe_harbor,
                         allows_disclosure=excluded.allows_disclosure,
                         rules_text=CASE WHEN excluded.rules_text != '' THEN excluded.rules_text ELSE programs.rules_text END,
@@ -3047,17 +3101,18 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
     for _cfg_key, _label, _fetcher in _listing_specs:
         _attempted = bool(refresh and platforms_cfg.get(_cfg_key, True))
         _data = []
+        _seen_count = None
         if _attempted:
             print(f"[*] Fetching {_label} programs (public listing)...")
             _data = _fetcher()
             if _data:
                 with conn:
-                    _sync_listing_programs(cur, _label, _data, now_ts)
-                print(f"[+] {_label} indexed: {len(_data)} programs.")
+                    _seen_count = _sync_listing_programs(cur, _label, _data, now_ts)
+                print(f"[+] {_label} indexed: {_seen_count} programs.")
             else:
                 print(f"[*] {_label}: no listing data returned.")
         platform_status[_cfg_key if _cfg_key != "sherlock" else "sherlock_bounties"] = (
-            _platform_status(_attempted, _data, "live-listing")
+            _platform_status(_attempted, _data, "live-listing", count=_seen_count)
         )
 
     codehawks_contests = []
@@ -3144,6 +3199,13 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
 
 
 def cmd_enrich(args):
+    limit = getattr(args, "limit", 10)
+    if limit is None:
+        limit = 10
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        raise ValueError(f"--limit must be an int >= 0, got {limit!r}")
+    if limit > 9223372036854775807:
+        raise ValueError("--limit exceeds SQLite INTEGER range")
     conn = get_db()
     ensure_schema(conn)
     cur = conn.cursor()
@@ -3161,7 +3223,7 @@ def cmd_enrich(args):
                WHERE platform='Bugcrowd'
                ORDER BY max_payout DESC
                LIMIT ?""",
-            (args.limit,),
+            (limit,),
         ).fetchall()
     for index, program in enumerate(programs):
         try:
@@ -3240,20 +3302,30 @@ def score_payout_velocity(prog):
 
 
 def evaluate_targets(config=None):
-    config = config or load_config()
+    if config is None:
+        config = load_config()
+    if not isinstance(config, dict):
+        config = {}
     conn = get_db()
     # No ensure_schema here: this library function is query-count-tested and
     # already hard-references migrated columns (official_first_seen_timestamp).
     # Callers on a stale DB must sync (which migrates) first.
     cur = conn.cursor()
 
-    filters = config.get("filters", {})
-    fast_triage = filters.get("fast_triage", {})
-    surface_cfg = filters.get("attack_surface_and_scope", {})
-    fresh_cfg = filters.get("freshness_and_competition", {})
-    payout_cfg = filters.get("payouts", {})
-    plat_cfg = config.get("platforms", {})
-    weights = config.get(
+    filters = config.get("filters")
+    if not isinstance(filters, dict):
+        filters = {}
+
+    def _subdict(parent, key):
+        value = parent.get(key) if isinstance(parent, dict) else None
+        return value if isinstance(value, dict) else {}
+
+    fast_triage = _subdict(filters, "fast_triage")
+    surface_cfg = _subdict(filters, "attack_surface_and_scope")
+    fresh_cfg = _subdict(filters, "freshness_and_competition")
+    payout_cfg = _subdict(filters, "payouts")
+    plat_cfg = _subdict(config, "platforms")
+    _weights_raw = config.get(
         "ranking_weights",
         {
             "payout_size": 0.35,
@@ -3262,8 +3334,10 @@ def evaluate_targets(config=None):
             "triage_speed": 0.15,
         },
     )
+    weights = _weights_raw if isinstance(_weights_raw, dict) else {}
 
-    kind_cfg = filters.get("program_kind", {"web2": True, "web3": True})
+    _kind_raw = filters.get("program_kind", {"web2": True, "web3": True})
+    kind_cfg = _kind_raw if isinstance(_kind_raw, dict) else {}
     allowed_kinds = [k for k, v in kind_cfg.items() if v]
 
     enabled_plats = [p for p, enabled in plat_cfg.items() if enabled]
@@ -3724,13 +3798,40 @@ def feed_provenance(conn=None):
             plat_status = json.loads(meta.get("platform_status", "{}") or "{}")
         except (TypeError, ValueError):
             plat_status = {}
+
+        def _cols(table):
+            try:
+                return {r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()}
+            except Exception:
+                return set()
+
+        _prog_cols = _cols("programs")
+        _asset_cols = _cols("assets")
+        _prog_live = (
+            "COALESCE(deleted_timestamp, 0)=0"
+            if "deleted_timestamp" in _prog_cols
+            else "1=1"
+        )
+        _prog_live_p = (
+            "COALESCE(p.deleted_timestamp, 0)=0"
+            if "deleted_timestamp" in _prog_cols
+            else "1=1"
+        )
+        _asset_live = (
+            "deleted_timestamp=0" if "deleted_timestamp" in _asset_cols else "1=1"
+        )
+        _asset_live_a = (
+            "a.deleted_timestamp=0" if "deleted_timestamp" in _asset_cols else "1=1"
+        )
         try:
-            n_programs = cur.execute("SELECT count(*) FROM programs").fetchone()[0]
+            n_programs = cur.execute(
+                "SELECT count(*) FROM programs WHERE " + _prog_live
+            ).fetchone()[0]
         except Exception:
             n_programs = None
         try:
             n_assets = cur.execute(
-                "SELECT count(*) FROM assets WHERE deleted_timestamp=0"
+                "SELECT count(*) FROM assets WHERE " + _asset_live
             ).fetchone()[0]
         except Exception:
             try:
@@ -3744,20 +3845,23 @@ def feed_provenance(conn=None):
         try:
             h1_total, h1_paid = cur.execute(
                 "SELECT count(*), sum(CASE WHEN max_payout > 0 THEN 1 ELSE 0 END)"
-                " FROM programs WHERE platform='HackerOne'"
+                " FROM programs WHERE platform='HackerOne' AND " + _prog_live
             ).fetchone()
         except Exception:
             h1_total, h1_paid = None, None
         try:
             im_programs = cur.execute(
-                "SELECT count(*) FROM programs WHERE platform='Immunefi'"
-            ).fetchone()[0]
-            im_assets = cur.execute(
-                "SELECT count(*) FROM assets a JOIN programs p ON a.program_id=p.id"
-                " WHERE p.platform='Immunefi' AND a.deleted_timestamp=0"
+                "SELECT count(*) FROM programs WHERE platform='Immunefi' AND " + _prog_live
             ).fetchone()[0]
         except Exception:
-            im_programs, im_assets = None, None
+            im_programs = None
+        try:
+            im_assets = cur.execute(
+                "SELECT count(*) FROM assets a JOIN programs p ON a.program_id=p.id"
+                " WHERE p.platform='Immunefi' AND " + _asset_live_a + " AND " + _prog_live_p
+            ).fetchone()[0]
+        except Exception:
+            im_assets = None
     finally:
         if own:
             conn.close()
@@ -3828,8 +3932,23 @@ def cmd_filter(args, config):
     ensure_schema(_schema_conn)
     _schema_conn.close()
     results = evaluate_targets(config)
-    limit = args.limit or config.get("display", {}).get("limit", 20)
-    fresh_cfg = config.get("filters", {}).get("freshness_and_competition", {})
+    _cfg = config if isinstance(config, dict) else {}
+    _display_cfg = _cfg.get("display")
+    if not isinstance(_display_cfg, dict):
+        _display_cfg = {}
+    limit = (
+        args.limit
+        if getattr(args, "limit", None) is not None
+        else _display_cfg.get("limit", 20)
+    )
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        raise ValueError(f"radar limit must be an int >= 0, got {limit!r}")
+    _filters_cfg = _cfg.get("filters")
+    if not isinstance(_filters_cfg, dict):
+        _filters_cfg = {}
+    fresh_cfg = _filters_cfg.get("freshness_and_competition", {})
+    if not isinstance(fresh_cfg, dict):
+        fresh_cfg = {}
     new_company_days = fresh_cfg.get("new_company_days", 90)
     new_asset_days = fresh_cfg.get("new_asset_days", 30)
 
@@ -3879,7 +3998,6 @@ def cmd_filter(args, config):
     )
 
     conn = get_db()
-    ensure_schema(conn)
     for i, p in enumerate(results[:limit], 1):
         if p["response_time_known"]:
             triage_info = f"{p['first_resp']}h avg first response (HackerOne feed)"
@@ -4171,7 +4289,9 @@ def cmd_export(args, config):
     conn = get_db()
     ensure_schema(conn)
     results = evaluate_targets(config)
-    limit = args.top or 30
+    limit = args.top if getattr(args, "top", None) is not None else 30
+    if limit < 0:
+        raise ValueError("--top must be >= 0")
     target_ids = [p["id"] for p in results[:limit]]
 
     cur = conn.cursor()
@@ -4237,6 +4357,17 @@ def apply_cli_overrides(config, args):
     return config
 
 
+def _non_negative_int(text):
+    """argparse type: canonical int >= 0 (0 means show/export none)."""
+    raw = str(text).strip()
+    if not re.fullmatch(r"[0-9]+", raw):
+        raise argparse.ArgumentTypeError(f"must be an integer >= 0, got {text!r}")
+    value = int(raw)
+    if value > 9223372036854775807:
+        raise argparse.ArgumentTypeError("integer exceeds SQLite INTEGER range")
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Scan4Me: Precision Bug Bounty Target Engine"
@@ -4263,6 +4394,20 @@ def main():
         help="Skip ProjectDiscovery supplemental repo",
     )
     p_sync.add_argument("--no-federacy", action="store_true", help="Skip Federacy feed")
+    p_sync.add_argument(
+        "--use-auth",
+        dest="use_auth",
+        action="store_true",
+        default=None,
+        help="Sync via authenticated platform APIs (needs keys; "
+        "default: config use_auth, else public feeds only)",
+    )
+    p_sync.add_argument(
+        "--no-auth",
+        dest="use_auth",
+        action="store_false",
+        help="Force unauthenticated public feeds, overriding config use_auth",
+    )
 
     p_enrich = sub.add_parser(
         "enrich",
@@ -4270,7 +4415,7 @@ def main():
     )
     p_enrich.add_argument(
         "--limit",
-        type=int,
+        type=_non_negative_int,
         default=10,
         help="Highest-paying Bugcrowd programs to enrich",
     )
@@ -4284,7 +4429,7 @@ def main():
     p_radar = sub.add_parser(
         "radar", help="List top targets filtered by surface area, speed, and cash"
     )
-    p_radar.add_argument("--limit", type=int, default=20)
+    p_radar.add_argument("--limit", type=_non_negative_int, default=20)
     p_radar.add_argument("--show-assets", action="store_true", default=True)
     p_radar.add_argument(
         "--no-show-assets",
@@ -4341,7 +4486,7 @@ def main():
         "export",
         help="Export clean target list for httpx/subfinder from filtered programs",
     )
-    p_export.add_argument("--top", type=int, default=30)
+    p_export.add_argument("--top", type=_non_negative_int, default=30)
     p_export.add_argument("--wildcards-only", action="store_true")
     p_export.add_argument("--clean", action="store_true")
     p_export.add_argument(
@@ -4387,7 +4532,10 @@ def main():
             plat_override["federacy"] = False
         merged_plat_cfg = {**config.get("platforms", {}), **plat_override}
         sync_data(
-            refresh=not args.offline, platforms_cfg=merged_plat_cfg, config=config
+            refresh=not args.offline,
+            platforms_cfg=merged_plat_cfg,
+            config=config,
+            use_auth=getattr(args, "use_auth", None),
         )
     elif args.command == "keys":
         creds = load_credentials(config)

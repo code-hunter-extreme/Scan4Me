@@ -2597,3 +2597,269 @@ def test_sherlock_scope_updated_captured():
     import datetime as _dt
     assert _dt.datetime.fromtimestamp(
         sher[0]["official_scope_updated_timestamp"]).year == 2026
+
+
+# ── P1 flag contracts (use_auth CLI, limit/top semantics, live counts) ───────
+
+
+def test_non_negative_int_arg_type():
+    import argparse
+
+    assert scan4me._non_negative_int("0") == 0
+    assert scan4me._non_negative_int("7") == 7
+    with pytest.raises(argparse.ArgumentTypeError):
+        scan4me._non_negative_int("-1")
+    with pytest.raises(argparse.ArgumentTypeError):
+        scan4me._non_negative_int("x")
+
+
+def test_sync_use_auth_reachable_via_cli(monkeypatch):
+    seen = []
+    monkeypatch.setattr(scan4me, "sync_data", lambda **k: seen.append(k))
+    monkeypatch.setattr(scan4me, "load_config", lambda: {})
+    for argv, want in (
+        (["scan4me", "sync", "--offline", "--use-auth"], True),
+        (["scan4me", "sync", "--offline", "--no-auth"], False),
+        (["scan4me", "sync", "--offline"], None),
+    ):
+        seen.clear()
+        monkeypatch.setattr(sys, "argv", argv)
+        scan4me.main()
+        assert seen and seen[0].get("use_auth") is want, (argv, seen)
+
+
+def test_cmd_filter_limit_zero_and_negative(monkeypatch, capsys):
+    _record_schema_then_eval(monkeypatch)
+    # One (incomplete) result row: limit=0 must display none. Under the old
+    # `args.limit or 20` bug the loop body ran and blew up on the stub row.
+    monkeypatch.setattr(scan4me, "evaluate_targets", lambda config=None: [{}])
+    scan4me.cmd_filter(
+        types.SimpleNamespace(limit=0), {"display": {"limit": 20}}
+    )
+    assert "Displaying Top 0" in capsys.readouterr().out
+    with pytest.raises(ValueError):
+        scan4me.cmd_filter(types.SimpleNamespace(limit=-1), {})
+
+
+def test_cmd_export_top_zero_and_negative(tmp_path, monkeypatch, capsys):
+    conn = _temp_db(tmp_path / "t.db")
+    pid = _seed_program(conn, "hackerone", "Acme", "acme")
+    _add_asset(conn, pid, "ok.acme.com", eligible_for_submission=1)
+    out = _run_export(tmp_path, monkeypatch, capsys, conn, [pid], top=0)
+    assert "ok.acme.com" not in out
+    conn2 = _temp_db(tmp_path / "t.db")
+    with pytest.raises(ValueError):
+        _run_export(tmp_path, monkeypatch, capsys, conn2, [pid], top=-1)
+
+
+def test_cmd_enrich_negative_limit_raises():
+    with pytest.raises(ValueError):
+        scan4me.cmd_enrich(types.SimpleNamespace(limit=-1, handle=None))
+
+
+def test_feed_provenance_counts_live_programs_only(tmp_path):
+    conn = _temp_db(tmp_path / "t.db")
+    live = _seed_program(conn, "HackerOne", "LiveCo", "liveco")
+    dead = _seed_program(conn, "HackerOne", "DeadCo", "deadco")
+    _seed_program(conn, "Immunefi", "GoneFi", "gonefi")
+    conn.execute("UPDATE programs SET deleted_timestamp=999 WHERE id=?", (dead,))
+    conn.execute(
+        "UPDATE programs SET deleted_timestamp=999 WHERE platform='Immunefi'"
+    )
+    conn.commit()
+    prov = scan4me.feed_provenance(conn)
+    conn.close()
+    assert prov["row_counts"]["programs"] == 1  # only LiveCo is live
+    assert not any("Immunefi: 1 programs" in g for g in prov["coverage_gaps"])
+    assert live  # silence linters; the seed itself is the fixture
+
+
+def test_platform_status_count_override_is_indexed_rows():
+    st = scan4me._platform_status(True, [1, 2, 3], "live-listing", count=1)
+    assert st == {"status": "ok", "count": 1, "source": "live-listing"}
+    st2 = scan4me._platform_status(True, [1, 2, 3], "feed")
+    assert st2["count"] == 3
+
+
+# ── falsifier regressions: status honesty, legacy provenance, bool config ───
+
+
+def test_coerce_bool_quoted_false_never_enables():
+    assert scan4me._coerce_bool("false") is False
+    assert scan4me._coerce_bool("0") is False
+    assert scan4me._coerce_bool("off") is False
+    assert scan4me._coerce_bool("true") is True
+    assert scan4me._coerce_bool("1") is True
+    assert scan4me._coerce_bool(True) is True
+    assert scan4me._coerce_bool(None) is False
+
+
+def test_platform_status_zero_indexed_is_empty_not_ok():
+    st = scan4me._platform_status(True, [{"x": 1}], "live-listing", count=0)
+    assert st["status"] == "empty"
+    assert st["count"] == 0
+    with pytest.raises(ValueError):
+        scan4me._platform_status(True, [1], "live-listing", count=-1)
+    with pytest.raises(ValueError):
+        scan4me._platform_status(True, [1], "live-listing", count=1.5)
+
+
+def test_listing_bad_payout_does_not_abort_sync(tmp_path):
+    conn = _temp_db(tmp_path / "t.db")
+    cur = conn.cursor()
+    seen = scan4me._sync_listing_programs(
+        cur,
+        "Bugbase",
+        [
+            {"handle": "bad", "name": "Bad Pay", "url": "https://x", "max_payout": "abc"},
+            {"handle": "good", "name": "Good Pay", "url": "https://y", "max_payout": "2500"},
+        ],
+        123,
+    )
+    conn.commit()
+    rows = cur.execute(
+        "SELECT handle, max_payout FROM programs WHERE platform='Bugbase' ORDER BY handle"
+    ).fetchall()
+    conn.close()
+    assert seen == 2
+    assert [(r[0], r[1]) for r in rows] == [("bad", 0.0), ("good", 2500.0)]
+
+
+def test_feed_provenance_legacy_schema_counts_and_gaps(tmp_path):
+    conn = sqlite3.connect(str(tmp_path / "legacy.db"))
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE programs (id INTEGER PRIMARY KEY, platform TEXT, max_payout REAL);
+        CREATE TABLE assets (id INTEGER PRIMARY KEY, program_id INTEGER);
+        CREATE TABLE contests (id INTEGER PRIMARY KEY);
+        CREATE TABLE sync_metadata (key TEXT, value TEXT);
+        """
+    )
+    conn.execute("INSERT INTO programs VALUES (1, 'HackerOne', 0)")
+    conn.execute("INSERT INTO programs VALUES (2, 'Immunefi', 1000)")
+    conn.execute("INSERT INTO assets VALUES (1, 2)")
+    conn.commit()
+    prov = scan4me.feed_provenance(conn)
+    conn.close()
+    assert prov["row_counts"]["programs"] == 2
+    assert any("HackerOne payouts: 0/1" in g for g in prov["coverage_gaps"])
+    assert any("Immunefi: 1 programs, 1 scope rows" in g for g in prov["coverage_gaps"])
+
+
+def test_feed_provenance_tombstoned_immunefi_assets_excluded(tmp_path):
+    conn = _temp_db(tmp_path / "t.db")
+    pid = _seed_program(conn, "Immunefi", "GoneFi", "gonefi")
+    _add_asset(conn, pid, "app.gonefi.example")
+    conn.execute("UPDATE programs SET deleted_timestamp=999 WHERE id=?", (pid,))
+    conn.commit()
+    prov = scan4me.feed_provenance(conn)
+    conn.close()
+    assert any("Immunefi: 0 programs, 0 scope rows" in g for g in prov["coverage_gaps"])
+
+
+def test_cmd_filter_bad_display_config_and_invalid_limit(monkeypatch, capsys):
+    _record_schema_then_eval(monkeypatch)
+    monkeypatch.setattr(scan4me, "evaluate_targets", lambda config=None: [])
+    scan4me.cmd_filter(
+        types.SimpleNamespace(limit=None), {"display": None, "filters": None}
+    )
+    assert "Displaying Top 0" in capsys.readouterr().out
+    with pytest.raises(ValueError):
+        scan4me.cmd_filter(
+            types.SimpleNamespace(limit=None), {"display": {"limit": 2.5}}
+        )
+
+
+def test_non_negative_int_rejects_underscores_and_huge():
+    import argparse
+
+    with pytest.raises(argparse.ArgumentTypeError):
+        scan4me._non_negative_int("1_0")
+    with pytest.raises(argparse.ArgumentTypeError):
+        scan4me._non_negative_int(str(10**30))
+
+
+def test_cmd_enrich_invalid_limits_raise_before_db():
+    with pytest.raises(ValueError):
+        scan4me.cmd_enrich(types.SimpleNamespace(limit=10**30, handle=None))
+    with pytest.raises(ValueError):
+        scan4me.cmd_enrich(types.SimpleNamespace(limit=1.5, handle=None))
+
+
+def test_bugbase_bad_max_bounty_does_not_abort_page():
+    bad = scan4me._parse_bugbase_page(
+        r'{"programName":"EvilCo","programUsername":"evilco","maxBounty":1.2.3,"programType":"bugbounty"}'
+        r'{"programName":"Dots","programUsername":"dots","maxBounty":...,"programType":"bugbounty"}'
+        r'{"programName":"Good","programUsername":"good","maxBounty":2500,"programType":"bugbounty"}'
+    )
+    assert [p["handle"] for p in bad] == ["evilco", "dots", "good"]
+    assert [p["max_payout"] for p in bad] == [0.0, 0.0, 2500.0]
+
+
+def test_evaluate_targets_bad_filters_real_path(tmp_path, monkeypatch):
+    db_path = tmp_path / "t.db"
+    conn = _temp_db(db_path)
+    conn.close()
+    monkeypatch.setattr(scan4me, "DB_PATH", db_path)
+    base = {"platforms": {"hackerone": True}}
+    for bad_filters in (
+        None,
+        "junk",
+        {"fast_triage": None},
+        {"freshness_and_competition": 42},
+    ):
+        assert scan4me.evaluate_targets({**base, "filters": bad_filters}) == []
+
+
+def test_sync_bugcrowd_public_file_preserves_known_payout(tmp_path, monkeypatch):
+    """Live-sync regression: Bugcrowd upsert must preserve programs.max_payout
+    (not reference contests.max_payout) and bad feed payouts must not abort."""
+    _no_auth(monkeypatch, tmp_path)
+    db_path = tmp_path / "t.db"
+    monkeypatch.setattr(scan4me, "CACHE_DATA_DIR", tmp_path / "cache")
+    monkeypatch.setattr(scan4me, "DB_PATH", db_path)
+    conn = _temp_db(db_path)
+    conn.execute(
+        "INSERT INTO programs (platform, name, handle, url, offers_bounties,"
+        " max_payout, first_seen_timestamp, last_updated_timestamp)"
+        " VALUES ('Bugcrowd', 'Old Corp', 'old-corp',"
+        " 'https://bugcrowd.com/old-corp', 1, 4321, 500, 1000)"
+    )
+    conn.execute(
+        "INSERT INTO sync_metadata(key, value) VALUES('baseline_complete', '1')"
+    )
+    conn.commit()
+    conn.close()
+    _write_feed(
+        tmp_path / "cache" / "data",
+        "bugcrowd_data.json",
+        [
+            {
+                "name": "Old Corp",
+                "url": "/old-corp",
+                "max_payout": "abc",
+                "targets": {"in_scope": [{"target": "app.old.example", "type": "website"}]},
+            },
+            {
+                "name": "New Corp",
+                "url": "/new-corp",
+                "max_payout": 2500,
+                "targets": {"in_scope": [{"target": "app.new.example", "type": "website"}]},
+            },
+        ],
+    )
+    scan4me.sync_data(
+        refresh=False,
+        platforms_cfg=_file_only_cfg(bugcrowd=True),
+        config={},
+        use_auth=False,
+    )
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT handle, max_payout FROM programs WHERE platform='Bugcrowd' ORDER BY handle"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows == [("new-corp", 2500.0), ("old-corp", 4321.0)]
