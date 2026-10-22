@@ -28,6 +28,9 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Dict, Any
 
+from scan4me_pkg.fx_rates import to_usd as _fx_to_usd
+from scan4me_pkg.fx_rates import FX_TO_USD as _STATIC_FX_TO_USD
+
 REPO_ROOT = Path(__file__).resolve().parent
 DB_PATH = REPO_ROOT / "scan4me.db"
 CONFIG_PATH = REPO_ROOT / "config.json"
@@ -500,25 +503,9 @@ DEFAULT_CONFIG = {
 }
 
 
-# Static approximate FX rates to USD for RANKING ONLY. Amounts are compared
-# against USD bands/floors; mixing raw EUR/GBP numbers into those bands
-# silently misranks programs. Unknown currencies convert to 0 (treated as
-# unknown payout, never guessed at par).
-_FX_TO_USD = {
-    "USD": 1.0, "USDC": 1.0, "USDT": 1.0, "DAI": 1.0,
-    "EUR": 1.08, "GBP": 1.27, "CHF": 1.13, "AUD": 0.66, "CAD": 0.73,
-}
-
-
 def _to_usd(amount, currency) -> float:
-    try:
-        value = float(amount or 0)
-    except (TypeError, ValueError):
-        return 0.0
-    if value <= 0:
-        return 0.0
-    rate = _FX_TO_USD.get(str(currency or "USD").strip().upper())
-    return value * rate if rate else 0.0
+    """Convert amount to USD using live/cached FX rates."""
+    return _fx_to_usd(amount, currency)
 
 
 def _coerce_bool(value, default=False):
@@ -842,6 +829,26 @@ def migrate_db(conn):
         "CREATE INDEX IF NOT EXISTS idx_contest_first_seen "
         "ON contests(first_seen_timestamp)"
     )
+
+    # Program change detection table (Phase 3)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS program_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            program_id INTEGER,
+            change_type TEXT,  -- 'scope_added', 'scope_removed', 'payout_changed', 'rules_changed', 'new_asset', 'tombstone_resurrected'
+            old_value TEXT,
+            new_value TEXT,
+            detected_at INTEGER,
+            FOREIGN KEY (program_id) REFERENCES programs(id)
+        )
+        """
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_program_changes_program "
+        "ON program_changes(program_id, detected_at)"
+    )
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS site_scans (
@@ -1177,10 +1184,36 @@ def sync_assets(cur, program_id, targets, identifier_key, type_key, now_ts, stat
         existing_assets.setdefault(
             (row["asset_identifier"] or "").strip().lower(), row
         )
+    
+    # Track changes for program_changes table
+    new_assets = []
+    resurrected_assets = []
+    updated_assets = []
+    removed_assets = []
+
     for identifier, spec in current_assets.items():
         asset_type, is_wildcard, bounty, submission, instruction, severity = spec
         existing = existing_assets.get(identifier.strip().lower())
         if existing:
+            if existing["deleted_timestamp"]:
+                # Resurrected
+                resurrected_assets.append(identifier)
+            else:
+                # Check for updates
+                cur.execute(
+                    "SELECT asset_type, is_wildcard, eligible_for_bounty, eligible_for_submission, instruction, max_severity FROM assets WHERE id=?",
+                    (existing["id"],),
+                )
+                old = cur.fetchone()
+                if old and (
+                    old["asset_type"] != asset_type
+                    or old["is_wildcard"] != is_wildcard
+                    or old["eligible_for_bounty"] != bounty
+                    or old["eligible_for_submission"] != submission
+                    or (old["instruction"] or "") != (instruction or "")
+                    or (old["max_severity"] or "") != (severity or "")
+                ):
+                    updated_assets.append(identifier)
             cur.execute(
                 """UPDATE assets SET asset_identifier=?, asset_type=?, is_wildcard=?,
                    eligible_for_bounty=?, eligible_for_submission=?,
@@ -1197,6 +1230,7 @@ def sync_assets(cur, program_id, targets, identifier_key, type_key, now_ts, stat
                 ),
             )
         else:
+            new_assets.append(identifier)
             cur.execute(
                 """INSERT INTO assets
                    (program_id, asset_identifier, asset_type, is_wildcard,
@@ -1224,10 +1258,42 @@ def sync_assets(cur, program_id, targets, identifier_key, type_key, now_ts, stat
         if lowered not in current_lower and not (row["deleted_timestamp"] or 0)
     ]
     if stale_ids:
+        # Record removed assets before tombstoning
+        for asset_id in stale_ids:
+            cur.execute("SELECT asset_identifier FROM assets WHERE id=?", (asset_id,))
+            row = cur.fetchone()
+            if row:
+                removed_assets.append(row["asset_identifier"])
         cur.executemany(
             "UPDATE assets SET deleted_timestamp=? WHERE id=?",
             ((now_ts, asset_id) for asset_id in stale_ids),
         )
+
+    # Record program changes
+    if new_assets:
+        for ident in new_assets:
+            cur.execute(
+                "INSERT INTO program_changes (program_id, change_type, old_value, new_value, detected_at) VALUES (?, 'scope_added', '', ?, ?)",
+                (program_id, ident, now_ts),
+            )
+    if resurrected_assets:
+        for ident in resurrected_assets:
+            cur.execute(
+                "INSERT INTO program_changes (program_id, change_type, old_value, new_value, detected_at) VALUES (?, 'tombstone_resurrected', '', ?, ?)",
+                (program_id, ident, now_ts),
+            )
+    if updated_assets:
+        for ident in updated_assets:
+            cur.execute(
+                "INSERT INTO program_changes (program_id, change_type, old_value, new_value, detected_at) VALUES (?, 'scope_updated', '', ?, ?)",
+                (program_id, ident, now_ts),
+            )
+    if removed_assets:
+        for ident in removed_assets:
+            cur.execute(
+                "INSERT INTO program_changes (program_id, change_type, old_value, new_value, detected_at) VALUES (?, 'scope_removed', ?, '', ?)",
+                (program_id, ident, now_ts),
+            )
 
 
 def sync_oos_assets(cur, program_id, targets, identifier_key, type_key, now_ts, stats=None):
@@ -1258,15 +1324,26 @@ def sync_oos_assets(cur, program_id, targets, identifier_key, type_key, now_ts, 
         (program_id,),
     ).fetchall():
         existing_oos.setdefault((row["asset_identifier"] or "").strip().lower(), row)
+
+    new_oos = []
+    removed_oos = []
+
     for identifier, (asset_type, is_wildcard) in current_oos.items():
         existing = existing_oos.get(identifier.strip().lower())
         if existing:
+            if existing["deleted_timestamp"]:
+                # Resurrected OOS
+                cur.execute(
+                    "INSERT INTO program_changes (program_id, change_type, old_value, new_value, detected_at) VALUES (?, 'oos_resurrected', '', ?, ?)",
+                    (program_id, identifier, now_ts),
+                )
             cur.execute(
                 """UPDATE oos_assets SET asset_identifier=?, asset_type=?, is_wildcard=?,
                    deleted_timestamp=0 WHERE id=?""",
                 (identifier, asset_type, is_wildcard, existing["id"]),
             )
         else:
+            new_oos.append(identifier)
             cur.execute(
                 """INSERT INTO oos_assets
                    (program_id, asset_identifier, asset_type, is_wildcard,
@@ -1282,10 +1359,27 @@ def sync_oos_assets(cur, program_id, targets, identifier_key, type_key, now_ts, 
         if lowered not in current_lower and not (row["deleted_timestamp"] or 0)
     ]
     if stale_ids:
+        for asset_id in stale_ids:
+            cur.execute("SELECT asset_identifier FROM oos_assets WHERE id=?", (asset_id,))
+            row = cur.fetchone()
+            if row:
+                removed_oos.append(row["asset_identifier"])
         cur.executemany(
             "UPDATE oos_assets SET deleted_timestamp=? WHERE id=?",
             ((now_ts, asset_id) for asset_id in stale_ids),
         )
+        for ident in removed_oos:
+            cur.execute(
+                "INSERT INTO program_changes (program_id, change_type, old_value, new_value, detected_at) VALUES (?, 'oos_removed', ?, '', ?)",
+                (program_id, ident, now_ts),
+            )
+
+    if new_oos:
+        for ident in new_oos:
+            cur.execute(
+                "INSERT INTO program_changes (program_id, change_type, old_value, new_value, detected_at) VALUES (?, 'oos_added', '', ?, ?)",
+                (program_id, ident, now_ts),
+            )
 
 
 def _sync_program_scope(
@@ -2108,6 +2202,54 @@ def _row_last_updated(existing, now_ts, refresh_ok):
         return now_ts
 
 
+def _record_program_change(cur, program_id, change_type, old_value, new_value, now_ts):
+    """Record a program-level change if the value actually changed."""
+    if old_value == new_value:
+        return
+    cur.execute(
+        "INSERT INTO program_changes (program_id, change_type, old_value, new_value, detected_at) VALUES (?, ?, ?, ?, ?)",
+        (program_id, change_type, str(old_value), str(new_value), now_ts),
+    )
+
+
+def _check_and_record_program_changes(cur, program_id, existing, new_values, now_ts):
+    """Check for program-level changes and record them.
+
+    existing: tuple from SELECT (id, first_seen, last_updated, max_payout, currency, rules_text, ...)
+    new_values: dict with keys max_payout, currency, rules_text, etc.
+    """
+    if existing is None:
+        return  # New program, no changes to record
+
+    # existing columns: id, first_seen_timestamp, last_updated_timestamp
+    # We need to query the full program record
+    cur.execute(
+        "SELECT max_payout, currency, rules_text, submission_state, offers_bounties FROM programs WHERE id=?",
+        (program_id,),
+    )
+    old = cur.fetchone()
+    if not old:
+        return
+
+    # Check payout change
+    old_max_payout = old["max_payout"] if isinstance(old, dict) else old[0]
+    old_currency = old["currency"] if isinstance(old, dict) else old[1]
+    old_rules = old["rules_text"] if isinstance(old, dict) else old[2]
+    old_submission_state = old["submission_state"] if isinstance(old, dict) else old[3]
+    old_offers_bounties = old["offers_bounties"] if isinstance(old, dict) else old[4]
+
+    if "max_payout" in new_values:
+        _record_program_change(cur, program_id, "payout_changed", old_max_payout, new_values["max_payout"], now_ts)
+    if "currency" in new_values:
+        _record_program_change(cur, program_id, "currency_changed", old_currency, new_values["currency"], now_ts)
+    if "rules_text" in new_values:
+        _record_program_change(cur, program_id, "rules_changed", old_rules, new_values["rules_text"], now_ts)
+    if "submission_state" in new_values:
+        _record_program_change(cur, program_id, "submission_state_changed", old_submission_state, new_values["submission_state"], now_ts)
+    if "offers_bounties" in new_values:
+        _record_program_change(cur, program_id, "offers_bounties_changed", old_offers_bounties, new_values["offers_bounties"], now_ts)
+
+
 def _platform_status(enabled, data, source, auth_used=False, count=None):
     """sync_metadata status entry for one platform feed (a staleness tripwire)."""
     if count is not None and (
@@ -2509,6 +2651,20 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
                     "SELECT id FROM programs WHERE platform=? AND handle=?",
                     ("HackerOne", handle),
                 ).fetchone()[0]
+                # Record program-level changes (payout, rules, etc.)
+                _check_and_record_program_changes(
+                    cur,
+                    prog_id,
+                    existing,
+                    {
+                        "max_payout": max_p,
+                        "currency": "USD",
+                        "rules_text": rules_txt,
+                        "submission_state": sub_state,
+                        "offers_bounties": offers_bounty,
+                    },
+                    now_ts,
+                )
                 _sync_program_scope(
                     cur,
                     prog_id,
@@ -2610,6 +2766,20 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
                     "SELECT id FROM programs WHERE platform=? AND handle=?",
                     ("Bugcrowd", handle),
                 ).fetchone()[0]
+                # Record program-level changes
+                _check_and_record_program_changes(
+                    cur,
+                    prog_id,
+                    existing,
+                    {
+                        "max_payout": max_p,
+                        "currency": "USD",
+                        "rules_text": rules_txt,
+                        "submission_state": "open",
+                        "offers_bounties": offers_bounty,
+                    },
+                    now_ts,
+                )
                 _sync_program_scope(
                     cur,
                     prog_id,
@@ -2718,6 +2888,20 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
                     "SELECT id FROM programs WHERE platform=? AND handle=?",
                     ("Intigriti", handle),
                 ).fetchone()[0]
+                # Record program-level changes
+                _check_and_record_program_changes(
+                    cur,
+                    prog_id,
+                    existing,
+                    {
+                        "max_payout": max_val,
+                        "currency": curr,
+                        "rules_text": "",
+                        "submission_state": sub_state,
+                        "offers_bounties": offers_bounty,
+                    },
+                    now_ts,
+                )
                 _sync_program_scope(
                     cur,
                     prog_id,
@@ -2812,6 +2996,20 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
                     "SELECT id FROM programs WHERE platform=? AND handle=?",
                     ("YesWeHack", handle),
                 ).fetchone()[0]
+                # Record program-level changes
+                _check_and_record_program_changes(
+                    cur,
+                    prog_id,
+                    existing,
+                    {
+                        "max_payout": max_val,
+                        "currency": "EUR",
+                        "rules_text": "",
+                        "submission_state": sub_state,
+                        "offers_bounties": offers_bounty,
+                    },
+                    now_ts,
+                )
                 _sync_program_scope(
                     cur,
                     prog_id,
