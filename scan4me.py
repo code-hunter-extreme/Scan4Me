@@ -26,6 +26,7 @@ import urllib.request
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import Dict, Any
 
 REPO_ROOT = Path(__file__).resolve().parent
 DB_PATH = REPO_ROOT / "scan4me.db"
@@ -233,10 +234,7 @@ def _fetch_h1_authenticated(username, api_token):
                 or attrs.get("max_payout")
                 or 0.0
             )
-            try:
-                max_payout = float(raw_max)
-            except (ValueError, TypeError):
-                max_payout = 0.0
+            max_payout = _safe_non_negative_float(raw_max)
             programs.append(
                 {
                     "handle": handle,
@@ -304,7 +302,7 @@ def _fetch_bugcrowd_authenticated(api_token):
             url = attrs.get("url", "") or f"https://bugcrowd.com/{handle}"
             if url.startswith("/"):
                 url = f"https://bugcrowd.com{url}"
-            max_p = float(attrs.get("max_payout", 0) or 0)
+            max_p = _safe_non_negative_float(attrs.get("max_payout", 0))
             programs.append(
                 {
                     "name": name,
@@ -358,7 +356,7 @@ def _fetch_intigriti_authenticated(api_token):
         for item in records:
             handle = item.get("handle") or str(item.get("id", ""))
             max_b = item.get("maxBounty") or item.get("max_bounty") or {}
-            max_val = float((max_b.get("value") or 0) if isinstance(max_b, dict) else 0)
+            max_val = _safe_non_negative_float(max_b.get("value") if isinstance(max_b, dict) else 0)
             curr = max_b.get("currency", "EUR") if isinstance(max_b, dict) else "EUR"
             programs.append(
                 {
@@ -418,7 +416,7 @@ def _fetch_yeswehack_authenticated(api_token):
                 {
                     "id": item.get("id", item.get("slug", "")),
                     "name": item.get("title", item.get("name", "")),
-                    "max_bounty": item.get("maxBounty", item.get("max_bounty", 0)),
+                    "max_bounty": _safe_non_negative_float(item.get("maxBounty", item.get("max_bounty", 0))),
                     "managed": bool(item.get("managed")),
                     "targets": {
                         "in_scope": [
@@ -567,10 +565,10 @@ def _deep_merge(base, override):
 def _normalize_weights(cfg):
     weights = cfg.get("ranking_weights")
     if isinstance(weights, dict) and weights:
-        total = sum(float(v or 0) for v in weights.values())
+        total = sum(_safe_non_negative_float(v) for v in weights.values())
         if total > 0:
             cfg["ranking_weights"] = {
-                k: float(v or 0) / total for k, v in weights.items()
+                k: _safe_non_negative_float(v) / total for k, v in weights.items()
             }
     return cfg
 
@@ -1026,6 +1024,45 @@ def _strip_host(value):
     if text.count(":") == 1 and "*" not in text:  # host:port
         text = text.split(":")[0]
     return text.strip().rstrip(".")
+
+
+def _strip_to_host(ident: str) -> str:
+    """Alias for _strip_host — consistent with Oracle intake naming."""
+    return _strip_host(ident)
+
+
+def _matches_site(prog: Dict[str, Any], site: str) -> bool:
+    """Precise --sites matching: exact on name/handle, domain-boundary on URLs.
+
+    Pure substring matching ("acm" hits "Acme", "evil-acme.com" hits
+    "acme.com") caused false-positive deep-dives, so:
+      - ``name`` / ``handle`` must equal the site (case-insensitive);
+      - ``url`` / ``website`` compare by host: equal, or one a
+        domain-boundary parent of the other (``app.acme.com`` matches a
+        program on ``acme.com``, but ``notacme.com`` never matches).
+    """
+    needle = (site or "").strip().lower().rstrip(".")
+    if not needle:
+        return False
+    for key in ("name", "handle"):
+        val = prog.get(key)
+        if isinstance(val, str) and val.strip().lower() == needle:
+            return True
+    needle_host = _strip_to_host(needle)
+    if not needle_host:
+        return False
+    for key in ("url", "website"):
+        val = prog.get(key)
+        if not isinstance(val, str) or not val.strip():
+            continue
+        host = _strip_to_host(val)
+        if not host:
+            continue
+        if needle_host == host:
+            return True
+        if host.endswith("." + needle_host) or needle_host.endswith("." + host):
+            return True
+    return False
 
 
 def canonicalize_asset(identifier, raw_type):
@@ -4330,6 +4367,214 @@ def cmd_export(args, config):
         print(val)
 
 
+def cmd_handoff(args, config):
+    """Generate Oracle P12 handoff file from prescan + scan reports."""
+    import json
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    HANDOFF_SCHEMA = "oracle.p12.handoff/v1"
+
+    def _utc_now():
+        return datetime.now(timezone.utc).isoformat()
+
+    def _stamp():
+        return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    # Load prescan report
+    prescan_path = Path(args.prescan_file)
+    if not prescan_path.exists():
+        raise FileNotFoundError(f"Prescan file not found: {prescan_path}")
+    with prescan_path.open(encoding="utf-8") as f:
+        prescan = json.load(f)
+
+    # Load scan report
+    scan_path = Path(args.scan_file)
+    if not scan_path.exists():
+        raise FileNotFoundError(f"Scan file not found: {scan_path}")
+    with scan_path.open(encoding="utf-8") as f:
+        scan = json.load(f)
+
+    # Extract triage config from config (used for prescan)
+    filters = config.get("filters", {})
+    fast_triage = filters.get("fast_triage", {})
+    surface_cfg = filters.get("attack_surface_and_scope", {})
+    fresh_cfg = filters.get("freshness_and_competition", {})
+    payout_cfg = filters.get("payouts", {})
+    kind_cfg = filters.get("program_kind", {"web2": True, "web3": True})
+    plat_cfg = config.get("platforms", {})
+    ranking_weights = config.get("ranking_weights", {})
+
+    # Build triage_config object for handoff
+    triage_config = {
+        "source": "triage.yaml",
+        "payout_floor_usd": payout_cfg.get("min_max_payout_usd"),
+        "fast_triage_enabled": fast_triage.get("enabled", True),
+        "max_first_response_hours": fast_triage.get("max_first_response_hours"),
+        "min_response_efficiency_pct": fast_triage.get("min_response_efficiency_pct"),
+        "min_in_scope_assets": surface_cfg.get("min_in_scope_assets"),
+        "wildcard_multiplier": surface_cfg.get("wildcard_multiplier"),
+        "prefer_new_assets": fresh_cfg.get("prefer_new_assets", False),
+        "new_asset_days": fresh_cfg.get("new_asset_days"),
+        "prefer_new_companies": fresh_cfg.get("prefer_new_companies", False),
+        "new_company_days": fresh_cfg.get("new_company_days"),
+        "max_rewarded_vulnerabilities": fresh_cfg.get("max_rewarded_vulnerabilities"),
+        "ranking_weights": ranking_weights,
+    }
+
+    # Get feed provenance
+    feed_prov = feed_provenance()
+
+    # Process verified programs from scan
+    verdicts = scan.get("verdicts", [])
+    verified = [v for v in verdicts if v.get("verdict") == "verified"]
+
+    # Sort by score descending
+    verified.sort(key=lambda v: (v.get("score", 0) or 0), reverse=True)
+
+    # Apply --sites filter if provided
+    sites = [s.strip() for s in (args.sites or []) if s and s.strip()]
+    excluded_named = []
+
+    if sites:
+        # Match sites against verified programs
+        picked = []
+        for site in sites:
+            match = next((v for v in verified if _matches_site(v, site)), None)
+            if match is not None:
+                if match not in picked:
+                    picked.append(match)
+                continue
+            # No verified hit: check if there's an unverified match
+            unverified_hit = next(
+                (v for v in verdicts if v.get("verdict") != "verified" and _matches_site(v, site)),
+                None,
+            )
+            if unverified_hit is not None:
+                excluded_named.append({
+                    "site": site,
+                    "reason": f"program not verified (verdict={unverified_hit.get('verdict', 'unknown')})",
+                })
+            else:
+                excluded_named.append({
+                    "site": site,
+                    "reason": "no such program in scan",
+                })
+        verified = picked
+    elif args.top_n is not None:
+        verified = verified[:args.top_n]
+
+    # Build ranked_verified entries with deep_dive
+    ranked_verified = []
+    for rank, v in enumerate(verified, 1):
+        # Find the original prescan program snapshot for additional fields
+        prescan_prog = next(
+            (p for p in prescan.get("programs", []) if p.get("handle") == v.get("handle") or p.get("name") == v.get("name")),
+            {}
+        )
+
+        # Build deep_dive object
+        scopes = v.get("structured_scopes", []) or []
+        company = {
+            "name": v.get("name", ""),
+            "handle": v.get("handle", ""),
+            "platform": v.get("platform", ""),
+            "url": v.get("url", ""),
+            "website": v.get("website", "") or "",
+            "offers_bounties": v.get("offers_bounties", False),
+            "managed_program": v.get("managed_triage", False),
+            "first_response_hours": v.get("first_response_hours"),
+            "bounty_awarded_hours": v.get("bounty_awarded_hours"),
+            "report_resolved_hours": v.get("report_resolved_hours"),
+            "response_efficiency": v.get("response_efficiency"),
+            "rewarded_vulnerabilities": v.get("rewarded_vulnerabilities"),
+            "validation_days": v.get("validation_days"),
+            "average_payout": v.get("average_payout"),
+            "program_kind": v.get("program_kind", "web2"),
+            "official_start_timestamp": v.get("official_start_timestamp"),
+            "official_scope_updated_timestamp": v.get("official_scope_updated_timestamp"),
+            "safe_harbor": v.get("safe_harbor", "Standard"),
+        }
+
+        # Build assets list with full detail from DB
+        conn = get_db()
+        ensure_schema(conn)
+        cur = conn.cursor()
+        prog_id = v.get("id")
+        assets = []
+        if prog_id:
+            cur.execute(
+                """SELECT asset_identifier, asset_type, is_wildcard, eligible_for_bounty,
+                          eligible_for_submission, instruction, max_severity, first_seen_timestamp
+                   FROM assets WHERE program_id=? AND deleted_timestamp=0""",
+                (prog_id,),
+            )
+            for row in cur.fetchall():
+                assets.append({
+                    "identifier": row[0],
+                    "type": row[1],
+                    "is_wildcard": bool(row[2]),
+                    "eligible_for_bounty": bool(row[3]),
+                    "eligible_for_submission": bool(row[4]),
+                    "instruction": row[5] or "",
+                    "max_severity": row[6] or "",
+                    "first_seen_ts": row[7],
+                })
+        conn.close()
+
+        deep_dive = {
+            "assets": assets,
+            "company": company,
+            "resources": {
+                "program_url": v.get("url", ""),
+                "platform": v.get("platform", ""),
+                "max_payout_usd": _to_usd(v.get("max_payout"), v.get("currency")),
+                "currency": v.get("currency", "USD"),
+                "scope_count": len(scopes),
+            },
+            "sources": ["scan4me:programs+assets"],
+            "checks": v.get("checks", {}),
+        }
+
+        ranked_verified.append({
+            "rank": rank,
+            "name": v.get("name", ""),
+            "handle": v.get("handle", ""),
+            "platform": v.get("platform", ""),
+            "url": v.get("url", ""),
+            "score": v.get("score", 0),
+            "max_payout_usd": _to_usd(v.get("max_payout"), v.get("currency")),
+            "currency": v.get("currency", "USD"),
+            "verdict": "verified",
+            "checks": v.get("checks", {}),
+            "deep_dive": deep_dive,
+        })
+
+    # Build handoff payload
+    payload = {
+        "_schema": HANDOFF_SCHEMA,
+        "created_utc": _utc_now(),
+        "prescan_report": str(prescan_path),
+        "scan_report": str(scan_path),
+        "no_cloud": args.no_cloud,
+        "selector": {"top_n": args.top_n, "sites": sites if sites else None},
+        "triage_config": triage_config,
+        "ranked_verified": ranked_verified,
+        "excluded_named": excluded_named,
+        "feed_provenance": feed_prov,
+        "note": "unverified programs never appear here; see the scan report",
+    }
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    print(f"[+] Handoff written to {output_path}")
+    print(f"    Verified programs: {len(ranked_verified)}")
+    if excluded_named:
+        print(f"    Excluded (named): {len(excluded_named)}")
+
+
 def apply_cli_overrides(config, args):
     """Apply CLI flags onto the loaded config (mutates and returns config).
 
@@ -4518,6 +4763,29 @@ def main():
         help="Bugcrowd competition-proxy ceiling",
     )
 
+    p_handoff = sub.add_parser(
+        "handoff",
+        help="Generate Oracle P12 handoff file from prescan + scan reports"
+    )
+    p_handoff.add_argument(
+        "--prescan-file", required=True, help="Path to prescan_*.json report"
+    )
+    p_handoff.add_argument(
+        "--scan-file", required=True, help="Path to scan_*.json report"
+    )
+    p_handoff.add_argument(
+        "--output", required=True, help="Output handoff file path"
+    )
+    p_handoff.add_argument(
+        "--top-n", type=_non_negative_int, default=None, help="Top N verified programs (overridden by --sites)"
+    )
+    p_handoff.add_argument(
+        "--sites", nargs="+", help="Explicit program names/handles/URLs to include (overrides --top-n)"
+    )
+    p_handoff.add_argument(
+        "--no-cloud", action="store_true", help="Mark handoff as no-cloud (local-only)"
+    )
+
     args = parser.parse_args()
 
     config = load_config()
@@ -4595,6 +4863,8 @@ def main():
         cmd_check(args)
     elif args.command == "export":
         cmd_export(args, config)
+    elif args.command == "handoff":
+        cmd_handoff(args, config)
     else:
         p_radar.print_help()
 

@@ -2863,3 +2863,410 @@ def test_sync_bugcrowd_public_file_preserves_known_payout(tmp_path, monkeypatch)
     finally:
         conn.close()
     assert rows == [("new-corp", 2500.0), ("old-corp", 4321.0)]
+
+
+# ── handoff command ──────────────────────────────────────────────────────────
+
+from datetime import datetime, timezone
+
+
+def test_handoff_command_generates_valid_schema(tmp_path, monkeypatch):
+    """handoff command produces oracle.p12.handoff/v1 with all required fields."""
+    # Setup: create a temp DB with some verified programs
+    db_path = tmp_path / "t.db"
+    conn = _temp_db(db_path)
+    cur = conn.cursor()
+    now = int(time.time())
+    day = 86400
+
+    # Insert a program with assets
+    cur.execute(
+        """INSERT INTO programs (platform, name, handle, url, offers_bounties,
+           managed_triage, first_response_hours, bounty_awarded_hours,
+           response_efficiency, max_payout, currency, first_seen_timestamp,
+           last_updated_timestamp, program_kind)
+           VALUES ('HackerOne', 'Test Corp', 'test-corp',
+           'https://hackerone.com/test-corp', 1, 1, 10.0, 100.0, 90.0,
+           50000, 'USD', ?, ?, 'web2')""",
+        (now - 200 * day, now),
+    )
+    prog_id = cur.lastrowid
+    cur.execute(
+        """INSERT INTO assets (program_id, asset_identifier, asset_type,
+           is_wildcard, first_seen_timestamp, eligible_for_bounty,
+           eligible_for_submission, instruction, max_severity)
+           VALUES (?, ?, 'URL', 0, ?, 1, 1, '', 'critical')""",
+        (prog_id, "api.test.example.com", now - 200 * day),
+    )
+    cur.execute(
+        """INSERT INTO assets (program_id, asset_identifier, asset_type,
+           is_wildcard, first_seen_timestamp, eligible_for_bounty,
+           eligible_for_submission, instruction, max_severity)
+           VALUES (?, ?, 'URL', 1, ?, 1, 1, '', '')""",
+        (prog_id, "*.test.example.com", now - 200 * day),
+    )
+    # Add sync_metadata
+    cur.execute(
+        "INSERT INTO sync_metadata(key, value) VALUES(?, ?)",
+        ("last_sync_ts", str(now)),
+    )
+    cur.execute(
+        "INSERT INTO sync_metadata(key, value) VALUES(?, ?)",
+        ("last_successful_sync_ts", str(now)),
+    )
+    cur.execute(
+        "INSERT INTO sync_metadata(key, value) VALUES(?, ?)",
+        ("last_refresh_ok", "1"),
+    )
+    cur.execute(
+        "INSERT INTO sync_metadata(key, value) VALUES(?, ?)",
+        ("upstream_sha", "abc1234"),
+    )
+    cur.execute(
+        "INSERT INTO sync_metadata(key, value) VALUES(?, ?)",
+        ("platform_status", json.dumps({
+            "hackerone": {"status": "ok", "count": 1, "source": "public-file"}
+        })),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(scan4me, "DB_PATH", db_path)
+
+    # Create prescan report
+    prescan = {
+        "_schema": "oracle.intake.prescan/v1",
+        "created_utc": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "trusted": False,
+        "source": "scan4me-ranked-db",
+        "synced": False,
+        "no_cloud": False,
+        "limit": 10,
+        "count": 1,
+        "programs": [{
+            "name": "Test Corp",
+            "handle": "test-corp",
+            "platform": "HackerOne",
+            "url": "https://hackerone.com/test-corp",
+            "website": "https://test.example.com",
+            "offers_bounties": True,
+            "managed_triage": True,
+            "first_response_hours": 10.0,
+            "bounty_awarded_hours": 100.0,
+            "response_efficiency": 90.0,
+            "max_payout": 50000.0,
+            "currency": "USD",
+            "program_kind": "web2",
+            "official_start_timestamp": now - 200 * day,
+            "official_scope_updated_timestamp": now,
+            "structured_scopes": [
+                {"asset_identifier": "api.test.example.com", "asset_type": "URL", "is_wildcard": False,
+                 "eligible_for_bounty": True, "eligible_for_submission": True, "instruction": "", "max_severity": "critical"},
+                {"asset_identifier": "*.test.example.com", "asset_type": "URL", "is_wildcard": True,
+                 "eligible_for_bounty": True, "eligible_for_submission": True, "instruction": "", "max_severity": ""},
+            ],
+        }],
+        "feed_provenance": scan4me.feed_provenance(),
+        "note": "raw prescan output",
+    }
+    prescan_path = tmp_path / "prescan_test.json"
+    prescan_path.write_text(json.dumps(prescan), encoding="utf-8")
+
+    # Create scan report (verified)
+    scan = {
+        "_schema": "oracle.intake.scan/v1",
+        "created_utc": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "prescan_report": str(prescan_path),
+        "no_cloud": False,
+        "count": 1,
+        "verified_count": 1,
+        "verdicts": [{
+            "name": "Test Corp",
+            "handle": "test-corp",
+            "platform": "HackerOne",
+            "url": "https://hackerone.com/test-corp",
+            "website": "https://test.example.com",
+            "offers_bounties": True,
+            "managed_triage": True,
+            "first_response_hours": 10.0,
+            "bounty_awarded_hours": 100.0,
+            "response_efficiency": 90.0,
+            "max_payout": 50000.0,
+            "currency": "USD",
+            "program_kind": "web2",
+            "official_start_timestamp": now - 200 * day,
+            "official_scope_updated_timestamp": now,
+            "structured_scopes": [
+                {"asset_identifier": "api.test.example.com", "asset_type": "URL", "is_wildcard": False,
+                 "eligible_for_bounty": True, "eligible_for_submission": True, "instruction": "", "max_severity": "critical"},
+                {"asset_identifier": "*.test.example.com", "asset_type": "URL", "is_wildcard": True,
+                 "eligible_for_bounty": True, "eligible_for_submission": True, "instruction": "", "max_severity": ""},
+            ],
+            "verdict": "verified",
+            "score": 85.0,
+            "checks": {
+                "scope_live": {"passed": True, "live_hosts": 1, "total_scope_hosts": 2},
+                "payouts_match": {"passed": True, "platform_max_payout": 50000, "db_max_payout": 50000},
+                "rules_unchanged": {"passed": True, "prescan_rules_sha256": "abc", "scan_rules_sha256": "abc"},
+            },
+            "id": prog_id,
+        }],
+        "feed_provenance": scan4me.feed_provenance(),
+        "note": "only verdict=verified programs may proceed",
+    }
+    scan_path = tmp_path / "scan_test.json"
+    scan_path.write_text(json.dumps(scan), encoding="utf-8")
+
+    # Run handoff command
+    output_path = tmp_path / "handoff_test.json"
+    import sys
+    sys.argv = ["scan4me.py", "handoff",
+                "--prescan-file", str(prescan_path),
+                "--scan-file", str(scan_path),
+                "--output", str(output_path),
+                "--top-n", "1"]
+    scan4me.main()
+
+    # Verify output
+    assert output_path.exists()
+    with output_path.open(encoding="utf-8") as f:
+        handoff = json.load(f)
+
+    # Check schema
+    assert handoff["_schema"] == "oracle.p12.handoff/v1"
+    assert "created_utc" in handoff
+    assert handoff["prescan_report"] == str(prescan_path)
+    assert handoff["scan_report"] == str(scan_path)
+    assert "triage_config" in handoff
+    assert handoff["triage_config"]["source"] == "triage.yaml"
+    assert "payout_floor_usd" in handoff["triage_config"]
+    assert "ranking_weights" in handoff["triage_config"]
+    assert "feed_provenance" in handoff
+    assert "ranked_verified" in handoff
+    assert len(handoff["ranked_verified"]) == 1
+
+    rv = handoff["ranked_verified"][0]
+    assert rv["rank"] == 1
+    assert rv["name"] == "Test Corp"
+    assert rv["handle"] == "test-corp"
+    assert rv["platform"] == "HackerOne"
+    assert rv["verdict"] == "verified"
+    assert rv["score"] == 85.0
+    assert "checks" in rv
+    assert rv["checks"]["scope_live"]["passed"] is True
+    assert "deep_dive" in rv
+    assert "assets" in rv["deep_dive"]
+    assert len(rv["deep_dive"]["assets"]) == 2
+    assert rv["deep_dive"]["assets"][0]["identifier"] == "api.test.example.com"
+    assert rv["deep_dive"]["assets"][0]["eligible_for_bounty"] is True
+    assert rv["deep_dive"]["assets"][1]["is_wildcard"] is True
+    assert "company" in rv["deep_dive"]
+    assert rv["deep_dive"]["company"]["name"] == "Test Corp"
+    assert "resources" in rv["deep_dive"]
+    assert "sources" in rv["deep_dive"]
+    assert rv["deep_dive"]["sources"] == ["scan4me:programs+assets"]
+
+    # Check excluded_named
+    assert "excluded_named" in handoff
+    assert handoff["excluded_named"] == []
+
+
+def test_handoff_command_sites_filter(tmp_path, monkeypatch):
+    """--sites filter overrides --top-n and includes only named verified programs."""
+    db_path = tmp_path / "t.db"
+    conn = _temp_db(db_path)
+    cur = conn.cursor()
+    now = int(time.time())
+    day = 86400
+
+    # Two programs
+    for i, name in enumerate(["Alpha Corp", "Beta Corp"]):
+        cur.execute(
+            """INSERT INTO programs (platform, name, handle, url, offers_bounties,
+               max_payout, currency, first_seen_timestamp, last_updated_timestamp)
+               VALUES ('HackerOne', ?, ?, ?, 1, ?, 'USD', ?, ?)""",
+            (name, name.lower().replace(" ", "-"), f"https://hackerone.com/{name.lower().replace(' ', '-')}", 10000, now, now),
+        )
+        prog_id = cur.lastrowid
+        cur.execute(
+            """INSERT INTO assets (program_id, asset_identifier, asset_type,
+               is_wildcard, first_seen_timestamp, eligible_for_bounty,
+               eligible_for_submission)
+               VALUES (?, ?, 'URL', 0, ?, 1, 1)""",
+            (prog_id, f"api{i}.example.com", now),
+        )
+    cur.execute("INSERT INTO sync_metadata(key, value) VALUES('last_sync_ts', ?)", (str(now),))
+    cur.execute("INSERT INTO sync_metadata(key, value) VALUES('last_successful_sync_ts', ?)", (str(now),))
+    cur.execute("INSERT INTO sync_metadata(key, value) VALUES('last_refresh_ok', '1')")
+    cur.execute("INSERT INTO sync_metadata(key, value) VALUES('upstream_sha', 'abc1234')")
+    cur.execute("INSERT INTO sync_metadata(key, value) VALUES('platform_status', ?)",
+                (json.dumps({"hackerone": {"status": "ok", "count": 2, "source": "public-file"}}),))
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(scan4me, "DB_PATH", db_path)
+
+    # Create prescan with both programs
+    prescan = {
+        "_schema": "oracle.intake.prescan/v1",
+        "created_utc": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "trusted": False,
+        "source": "scan4me-ranked-db",
+        "synced": False,
+        "no_cloud": False,
+        "limit": 10,
+        "count": 2,
+        "programs": [
+            {"name": "Alpha Corp", "handle": "alpha-corp", "platform": "HackerOne",
+             "url": "https://hackerone.com/alpha-corp", "offers_bounties": True,
+             "max_payout": 10000, "currency": "USD", "program_kind": "web2",
+             "structured_scopes": [{"asset_identifier": "api0.example.com", "asset_type": "URL", "is_wildcard": False,
+                                    "eligible_for_bounty": True, "eligible_for_submission": True}]},
+            {"name": "Beta Corp", "handle": "beta-corp", "platform": "HackerOne",
+             "url": "https://hackerone.com/beta-corp", "offers_bounties": True,
+             "max_payout": 10000, "currency": "USD", "program_kind": "web2",
+             "structured_scopes": [{"asset_identifier": "api1.example.com", "asset_type": "URL", "is_wildcard": False,
+                                    "eligible_for_bounty": True, "eligible_for_submission": True}]},
+        ],
+        "feed_provenance": scan4me.feed_provenance(),
+        "note": "raw prescan output",
+    }
+    prescan_path = tmp_path / "prescan_test.json"
+    prescan_path.write_text(json.dumps(prescan), encoding="utf-8")
+
+    # Create scan with both verified
+    scan = {
+        "_schema": "oracle.intake.scan/v1",
+        "created_utc": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "prescan_report": str(prescan_path),
+        "no_cloud": False,
+        "count": 2,
+        "verified_count": 2,
+        "verdicts": [
+            {"name": "Alpha Corp", "handle": "alpha-corp", "platform": "HackerOne",
+             "url": "https://hackerone.com/alpha-corp", "offers_bounties": True,
+             "max_payout": 10000, "currency": "USD", "program_kind": "web2",
+             "verdict": "verified", "score": 90.0, "id": 1,
+             "checks": {"scope_live": {"passed": True}, "payouts_match": {"passed": True}, "rules_unchanged": {"passed": True}},
+             "structured_scopes": [{"asset_identifier": "api0.example.com", "asset_type": "URL", "is_wildcard": False}]},
+            {"name": "Beta Corp", "handle": "beta-corp", "platform": "HackerOne",
+             "url": "https://hackerone.com/beta-corp", "offers_bounties": True,
+             "max_payout": 10000, "currency": "USD", "program_kind": "web2",
+             "verdict": "verified", "score": 80.0, "id": 2,
+             "checks": {"scope_live": {"passed": True}, "payouts_match": {"passed": True}, "rules_unchanged": {"passed": True}},
+             "structured_scopes": [{"asset_identifier": "api1.example.com", "asset_type": "URL", "is_wildcard": False}]},
+        ],
+        "feed_provenance": scan4me.feed_provenance(),
+        "note": "only verdict=verified programs may proceed",
+    }
+    scan_path = tmp_path / "scan_test.json"
+    scan_path.write_text(json.dumps(scan), encoding="utf-8")
+
+    # Run handoff with --sites
+    output_path = tmp_path / "handoff_test.json"
+    import sys
+    sys.argv = ["scan4me.py", "handoff",
+                "--prescan-file", str(prescan_path),
+                "--scan-file", str(scan_path),
+                "--output", str(output_path),
+                "--sites", "Beta Corp"]
+    scan4me.main()
+
+    with output_path.open(encoding="utf-8") as f:
+        handoff = json.load(f)
+
+    assert len(handoff["ranked_verified"]) == 1
+    assert handoff["ranked_verified"][0]["name"] == "Beta Corp"
+    assert handoff["selector"]["sites"] == ["Beta Corp"]
+    assert handoff["selector"]["top_n"] is None  # sites overrides top_n
+
+
+def test_handoff_command_excludes_unverified_named(tmp_path, monkeypatch):
+    """Named but unverified programs go to excluded_named with reason."""
+    db_path = tmp_path / "t.db"
+    conn = _temp_db(db_path)
+    cur = conn.cursor()
+    now = int(time.time())
+    day = 86400
+
+    cur.execute(
+        """INSERT INTO programs (platform, name, handle, url, offers_bounties,
+           max_payout, currency, first_seen_timestamp, last_updated_timestamp)
+           VALUES ('HackerOne', 'Ghost Corp', 'ghost-corp',
+           'https://hackerone.com/ghost-corp', 1, 10000, 'USD', ?, ?)""",
+        (now, now),
+    )
+    cur.execute("INSERT INTO sync_metadata(key, value) VALUES('last_sync_ts', ?)", (str(now),))
+    cur.execute("INSERT INTO sync_metadata(key, value) VALUES('last_successful_sync_ts', ?)", (str(now),))
+    cur.execute("INSERT INTO sync_metadata(key, value) VALUES('last_refresh_ok', '1')")
+    cur.execute("INSERT INTO sync_metadata(key, value) VALUES('upstream_sha', 'abc1234')")
+    cur.execute(
+        "INSERT INTO sync_metadata(key, value) VALUES(?, ?)",
+        ("platform_status", json.dumps({
+            "hackerone": {"status": "ok", "count": 1, "source": "public-file"}
+        })),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(scan4me, "DB_PATH", db_path)
+
+    prescan = {
+        "_schema": "oracle.intake.prescan/v1",
+        "created_utc": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "trusted": False,
+        "source": "scan4me-ranked-db",
+        "synced": False,
+        "no_cloud": False,
+        "limit": 10,
+        "count": 1,
+        "programs": [{
+            "name": "Ghost Corp", "handle": "ghost-corp", "platform": "HackerOne",
+            "url": "https://hackerone.com/ghost-corp", "offers_bounties": True,
+            "max_payout": 10000, "currency": "USD", "program_kind": "web2",
+            "structured_scopes": [{"asset_identifier": "api.ghost.example", "asset_type": "URL", "is_wildcard": False}]},
+        ],
+        "feed_provenance": scan4me.feed_provenance(),
+        "note": "raw prescan output",
+    }
+    prescan_path = tmp_path / "prescan_test.json"
+    prescan_path.write_text(json.dumps(prescan), encoding="utf-8")
+
+    # Scan marks it unverified
+    scan = {
+        "_schema": "oracle.intake.scan/v1",
+        "created_utc": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "prescan_report": str(prescan_path),
+        "no_cloud": False,
+        "count": 1,
+        "verified_count": 0,
+        "verdicts": [{
+            "name": "Ghost Corp", "handle": "ghost-corp", "platform": "HackerOne",
+            "url": "https://hackerone.com/ghost-corp", "offers_bounties": True,
+            "max_payout": 10000, "currency": "USD", "program_kind": "web2",
+            "verdict": "unverified", "score": 0,
+            "checks": {"scope_live": {"passed": False}, "payouts_match": {"passed": True}, "rules_unchanged": {"passed": True}},
+            "structured_scopes": [{"asset_identifier": "api.ghost.example", "asset_type": "URL", "is_wildcard": False}],
+        }],
+        "feed_provenance": scan4me.feed_provenance(),
+        "note": "only verdict=verified programs may proceed",
+    }
+    scan_path = tmp_path / "scan_test.json"
+    scan_path.write_text(json.dumps(scan), encoding="utf-8")
+
+    output_path = tmp_path / "handoff_test.json"
+    import sys
+    sys.argv = ["scan4me.py", "handoff",
+                "--prescan-file", str(prescan_path),
+                "--scan-file", str(scan_path),
+                "--output", str(output_path),
+                "--sites", "Ghost Corp"]
+    scan4me.main()
+
+    with output_path.open(encoding="utf-8") as f:
+        handoff = json.load(f)
+
+    assert len(handoff["ranked_verified"]) == 0
+    assert len(handoff["excluded_named"]) == 1
+    assert handoff["excluded_named"][0]["site"] == "Ghost Corp"
+    assert "not verified" in handoff["excluded_named"][0]["reason"].lower()
