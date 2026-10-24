@@ -1587,6 +1587,18 @@ def test_normalizer_keeps_cidr_and_app_ids():
         "com.example.app", "GOOGLE_PLAY_APP_ID"
     )
     assert (ident, atype, wild, ok) == ("com.example.app", "android_app", 0, True)
+    ident, atype, wild, ok = scan4me.canonicalize_asset(
+        "https://github.com/ensdomains/ens-contracts.git", "SOURCE_CODE"
+    )
+    assert (ident, atype, wild, ok) == (
+        "github.com/ensdomains/ens-contracts", "source_code", 0, True
+    )
+    ident, atype, wild, ok = scan4me.canonicalize_asset(
+        "https://github.com/worldcoin/world-id-contracts", "URL"
+    )
+    assert (ident, atype, wild, ok) == (
+        "github.com/worldcoin/world-id-contracts", "source_code", 0, True
+    )
 
 
 def test_scope_match_scheme_prefixed_wildcard():

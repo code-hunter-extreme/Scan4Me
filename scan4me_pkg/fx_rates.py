@@ -23,6 +23,10 @@ _STATIC_FX_TO_USD = {
 }
 
 CACHE_TTL = 86400  # 24 hours
+_MEMO_RATES: Optional[Dict[str, float]] = None
+_MEMO_TS: float = 0.0
+_USD_PARITY = {"USD", "USDC", "USDT", "DAI"}
+
 
 def _cache_path() -> Path:
     """Get cache file path."""
@@ -84,25 +88,36 @@ def get_fx_rates(force_refresh: bool = False) -> Dict[str, float]:
         Dict mapping currency code -> USD rate.
         Always includes fallback static rates for unknown currencies.
     """
-    # Try cache first (unless force_refresh)
+    global _MEMO_RATES, _MEMO_TS
+    now = time.time()
+    if not force_refresh and _MEMO_RATES is not None and (now - _MEMO_TS < CACHE_TTL):
+        return _MEMO_RATES
+
+    # Try disk cache first (unless force_refresh)
     if not force_refresh:
         cached = _load_cached_rates()
         if cached:
-            # Merge with static fallback for any missing
             merged = _STATIC_FX_TO_USD.copy()
             merged.update(cached)
+            _MEMO_RATES = merged
+            _MEMO_TS = now
             return merged
-
-    # Fetch live
-    live = _fetch_live_rates()
-    if live:
-        _save_cached_rates(live)
+        # Offline/read-path default: never block scoring loops on live HTTP;
+        # memoize and persist static fallback until an explicit refresh.
         merged = _STATIC_FX_TO_USD.copy()
-        merged.update(live)
+        _MEMO_RATES = merged
+        _MEMO_TS = now
         return merged
 
-    # Fallback to static
-    return _STATIC_FX_TO_USD.copy()
+    # Explicit live fetch (force_refresh=True)
+    live = _fetch_live_rates()
+    merged = _STATIC_FX_TO_USD.copy()
+    if live:
+        merged.update(live)
+    _save_cached_rates(merged)
+    _MEMO_RATES = merged
+    _MEMO_TS = now
+    return merged
 
 
 def to_usd(amount, currency: str) -> float:
@@ -122,8 +137,12 @@ def to_usd(amount, currency: str) -> float:
     if value <= 0:
         return 0.0
 
+    cur = str(currency or "USD").strip().upper()
+    if cur in _USD_PARITY:
+        return value
+
     rates = get_fx_rates()
-    rate = rates.get(str(currency or "USD").strip().upper())
+    rate = rates.get(cur)
     return value * rate if rate else 0.0
 
 

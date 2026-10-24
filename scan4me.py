@@ -1119,6 +1119,22 @@ def canonicalize_asset(identifier, raw_type):
             return "", "other", 0, False
         return lowered, atype, 0, True
 
+    # Source repositories (github.com/owner/repo, gitlab.com/owner/repo):
+    # preserve <host>/<owner>[/<repo>] instead of stripping path to bare
+    # "github.com", so Oracle's repo auto-cloner and code lens receive the
+    # real repository path.
+    _repo_m = re.match(
+        r"^(?:https?://)?(github\.com|gitlab\.com)/([\w.\-]+(?:/[\w.\-*]+)?)",
+        lowered,
+    )
+    if _repo_m:
+        repo_path = _repo_m.group(2).rstrip("/")
+        if repo_path.endswith(".git"):
+            repo_path = repo_path[:-4]
+        out_type = atype if atype in ("source_code", "smart_contract") else "source_code"
+        is_wild = 1 if "*" in repo_path else 0
+        return f"{_repo_m.group(1)}/{repo_path}", out_type, is_wild, True
+
     host = _strip_host(raw)
     if not host or " " in host:
         return "", "other", 0, False
