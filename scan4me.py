@@ -205,7 +205,7 @@ def _h1_in_scope(structured_scopes):
     return out
 
 
-def _fetch_h1_authenticated(username, api_token):
+def _fetch_h1_authenticated(username, api_token, delay=1.0):
     """Fetch your full HackerOne program list via the authenticated API.
 
     Returns private + public programs you have access to.
@@ -215,6 +215,8 @@ def _fetch_h1_authenticated(username, api_token):
     programs = []
     page = 1
     while True:
+        if page > 1 and delay and delay > 0:
+            time.sleep(delay)
         try:
             data = _api_request(
                 f"{H1_API_BASE}/hackers/programs"
@@ -276,7 +278,7 @@ def _fetch_h1_authenticated(username, api_token):
     return programs
 
 
-def _fetch_bugcrowd_authenticated(api_token):
+def _fetch_bugcrowd_authenticated(api_token, delay=1.0):
     """Fetch your Bugcrowd program list via the authenticated API.
 
     Endpoint: GET /engagements (paginated).
@@ -285,6 +287,8 @@ def _fetch_bugcrowd_authenticated(api_token):
     programs = []
     page = 1
     while True:
+        if page > 1 and delay and delay > 0:
+            time.sleep(delay)
         try:
             data = _api_request(
                 f"{BUGCROWD_API_BASE}/engagements?page={page}&sort=name",
@@ -333,7 +337,7 @@ def _fetch_bugcrowd_authenticated(api_token):
     return programs
 
 
-def _fetch_intigriti_authenticated(api_token):
+def _fetch_intigriti_authenticated(api_token, delay=1.0):
     """Fetch your Intigriti program list via the authenticated API.
 
     Endpoint: GET /core/researcher/programs (paginated).
@@ -342,6 +346,8 @@ def _fetch_intigriti_authenticated(api_token):
     programs = []
     page = 1
     while True:
+        if page > 1 and delay and delay > 0:
+            time.sleep(delay)
         try:
             data = _api_request(
                 f"{INTIGRITI_API_BASE}/researcher/programs"
@@ -392,7 +398,7 @@ def _fetch_intigriti_authenticated(api_token):
     return programs
 
 
-def _fetch_yeswehack_authenticated(api_token):
+def _fetch_yeswehack_authenticated(api_token, delay=1.0):
     """Fetch your YesWeHack program list via the authenticated API.
 
     Endpoint: GET /programs (paginated, includes private programs).
@@ -401,6 +407,8 @@ def _fetch_yeswehack_authenticated(api_token):
     programs = []
     page = 1
     while True:
+        if page > 1 and delay and delay > 0:
+            time.sleep(delay)
         try:
             data = _api_request(
                 f"{YESWEHACK_API_BASE}/programs?page={page}&perPage=50",
@@ -2419,7 +2427,13 @@ def _sync_listing_contests(cur, platform, contests, now_ts):
     return seen
 
 
-def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
+def sync_data(
+    refresh=True,
+    platforms_cfg=None,
+    config=None,
+    use_auth=None,
+    auth_delay=1.0,
+):
     """Sync all enabled feed sources into the local SQLite database.
 
     By default Scan4Me operates in UNAUTHENTICATED mode (``use_auth=False`` unless
@@ -2544,7 +2558,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
         print(
             "[*] HackerOne: API key found — using authenticated feed (includes private invites)."
         )
-        h1_data = _fetch_h1_authenticated(h1_username, h1_token)
+        h1_data = _fetch_h1_authenticated(h1_username, h1_token, delay=auth_delay)
         h1_source = "authenticated"
     else:
         if bool(h1_username) != bool(h1_token):
@@ -2689,7 +2703,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
         print(
             "[*] Bugcrowd: API key found — using authenticated feed (includes private programs)."
         )
-        bc_data = _fetch_bugcrowd_authenticated(bc_token)
+        bc_data = _fetch_bugcrowd_authenticated(bc_token, delay=auth_delay)
         bc_source = "authenticated"
     else:
         bc_file = local_data_dir / "bugcrowd_data.json"
@@ -2804,7 +2818,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
         print(
             "[*] Intigriti: API key found — using authenticated feed (includes private programs)."
         )
-        inti_data = _fetch_intigriti_authenticated(inti_token)
+        inti_data = _fetch_intigriti_authenticated(inti_token, delay=auth_delay)
         inti_source = "authenticated"
     else:
         inti_file = local_data_dir / "intigriti_data.json"
@@ -2926,7 +2940,7 @@ def sync_data(refresh=True, platforms_cfg=None, config=None, use_auth=None):
         print(
             "[*] YesWeHack: API key found — using authenticated feed (includes private programs)."
         )
-        ywh_data = _fetch_yeswehack_authenticated(ywh_token)
+        ywh_data = _fetch_yeswehack_authenticated(ywh_token, delay=auth_delay)
         ywh_source = "authenticated"
     else:
         ywh_file = local_data_dir / "yeswehack_data.json"
@@ -4854,6 +4868,12 @@ def main():
         action="store_false",
         help="Force unauthenticated public feeds, overriding config use_auth",
     )
+    p_sync.add_argument(
+        "--auth-delay",
+        type=float,
+        default=1.0,
+        help="Seconds between paginated authenticated API requests (default: 1.0)",
+    )
 
     p_enrich = sub.add_parser(
         "enrich",
@@ -5005,6 +5025,7 @@ def main():
             platforms_cfg=merged_plat_cfg,
             config=config,
             use_auth=getattr(args, "use_auth", None),
+            auth_delay=getattr(args, "auth_delay", 1.0),
         )
     elif args.command == "keys":
         creds = load_credentials(config)

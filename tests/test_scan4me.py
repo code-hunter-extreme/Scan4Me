@@ -3270,3 +3270,20 @@ def test_handoff_command_excludes_unverified_named(tmp_path, monkeypatch):
     assert len(handoff["excluded_named"]) == 1
     assert handoff["excluded_named"][0]["site"] == "Ghost Corp"
     assert "not verified" in handoff["excluded_named"][0]["reason"].lower()
+
+
+def test_authenticated_fetchers_support_rate_limit_delay(monkeypatch):
+    import inspect
+    for fn in (
+        scan4me._fetch_h1_authenticated,
+        scan4me._fetch_bugcrowd_authenticated,
+        scan4me._fetch_intigriti_authenticated,
+        scan4me._fetch_yeswehack_authenticated,
+    ):
+        sig = inspect.signature(fn)
+        assert "delay" in sig.parameters
+        assert sig.parameters["delay"].default == 1.0
+    sync_sig = inspect.signature(scan4me.sync_data)
+    assert "auth_delay" in sync_sig.parameters
+    assert sync_sig.parameters["auth_delay"].default == 1.0
+
