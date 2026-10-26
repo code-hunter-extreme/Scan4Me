@@ -1507,11 +1507,17 @@ def test_p5_api_request_auth_headers(monkeypatch):
         def __exit__(self, *exc):
             return False
 
-    def fake_urlopen(req, timeout=None):
-        seen["auth"] = req.get_header("Authorization")
-        return _JsonResp()
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            seen["auth"] = req.get_header("Authorization")
+            return _JsonResp()
 
-    monkeypatch.setattr(scan4me.urllib.request, "urlopen", fake_urlopen)
+    def fake_build_opener(*handlers):
+        # S5: authenticated calls must go through the no-redirect opener.
+        assert any(isinstance(h, type) and issubclass(h, scan4me._NoRedirectHandler) or isinstance(h, scan4me._NoRedirectHandler) for h in handlers)
+        return _FakeOpener()
+
+    monkeypatch.setattr(scan4me.urllib.request, "build_opener", fake_build_opener)
     scan4me._api_request("https://x.test", auth_basic=("u", "t"))
     import base64
 
@@ -1574,6 +1580,70 @@ def test_normalizer_rejects_non_hosts():
     assert scan4me.canonicalize_asset("", "url")[3] is False
     assert scan4me.canonicalize_asset("mid*dle.com", "url")[3] is False
     assert scan4me.canonicalize_asset("not a cidr", "CIDR")[3] is False
+
+
+def test_normalizer_rejects_public_suffix_wildcards_and_controls():
+    # Public-suffix wildcards would authorize an entire TLD downstream.
+    for bad in ("*.com", "*.co.uk", "*.com.au", "*.io", "*com"):
+        assert scan4me.canonicalize_asset(bad, "wildcard")[3] is False, bad
+    # Registrable-domain wildcards stay valid scope.
+    assert scan4me.canonicalize_asset("*.acme.com", "wildcard")[3] is True
+    assert scan4me.canonicalize_asset("*.example.co.uk", "wildcard")[3] is True
+    assert scan4me.canonicalize_asset("*-vpn.8x8.com", "wildcard")[3] is True
+    # Control / whitespace characters must never enter a scope row.
+    for bad in ("acme\x01.com", "acme\n.com", "acme\t.com", "acme\x7f.com"):
+        assert scan4me.canonicalize_asset(bad, "url")[3] is False, repr(bad)
+
+
+def test_api_request_never_forwards_auth_on_redirect():
+    # S5: a platform 3xx must surface as an error, never re-send the
+    # Authorization header to the redirect target (loopback-only probe).
+    import threading
+    import urllib.error
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    received = []
+
+    class Sink(BaseHTTPRequestHandler):
+        def do_GET(self):
+            received.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *args):
+            pass
+
+    sink = HTTPServer(("127.0.0.1", 0), Sink)
+    threading.Thread(target=sink.serve_forever, daemon=True).start()
+
+    class Redirector(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header(
+                "Location", f"http://127.0.0.1:{sink.server_port}/sink"
+            )
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    src = HTTPServer(("127.0.0.1", 0), Redirector)
+    threading.Thread(target=src.serve_forever, daemon=True).start()
+    try:
+        try:
+            scan4me._api_request(
+                f"http://127.0.0.1:{src.server_port}/api", bearer="dummy-token"
+            )
+            raised = None
+        except urllib.error.HTTPError as exc:
+            raised = exc.code
+        assert raised == 302, f"expected redirect refusal, got {raised!r}"
+        assert received == [], "Authorization reached the redirect target"
+    finally:
+        src.shutdown()
+        sink.shutdown()
 
 
 def test_normalizer_keeps_cidr_and_app_ids():

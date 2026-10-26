@@ -151,6 +151,14 @@ def load_credentials(config=None):
     }
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect: urllib would otherwise re-send the
+    Authorization header to the redirect target, any host or scheme."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def _api_request(
     url, *, auth_basic=None, bearer=None, token_header=None, method="GET", timeout=30
 ):
@@ -159,6 +167,9 @@ def _api_request(
     auth_basic   : (username, password/token) tuple → HTTP Basic Authorization
     bearer       : string → Authorization: Bearer <token>
     token_header : string → Authorization: Token <token>
+
+    Redirects are refused (a 3xx raises HTTPError): platform credentials
+    must never be forwarded to a host the platform did not name (S5).
     """
     req = urllib.request.Request(url, method=method)
     req.add_header("Accept", "application/json")
@@ -170,7 +181,8 @@ def _api_request(
         req.add_header("Authorization", f"Bearer {bearer}")
     elif token_header:
         req.add_header("Authorization", f"Token {token_header}")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
+    opener = urllib.request.build_opener(_NoRedirectHandler)
+    with opener.open(req, timeout=timeout) as resp:  # nosec B310
         return json.load(resp)
 
 
@@ -1080,6 +1092,39 @@ def _matches_site(prog: Dict[str, Any], site: str) -> bool:
     return False
 
 
+# Common multi-label public suffixes. A wildcard anchored at one of these
+# (or at a bare TLD) would authorize an entire registry downstream, so
+# ingest rejects it. Heuristic subset, not the full PSL: when in doubt the
+# label-count rule below still blocks every single-label base.
+_MULTI_LABEL_PUBLIC_SUFFIXES = frozenset({
+    "ac.uk", "co.uk", "gov.uk", "org.uk",
+    "com.au", "net.au", "org.au", "co.nz", "org.nz",
+    "com.br", "com.cn", "com.tw", "com.hk", "com.sg",
+    "co.jp", "co.kr", "co.in", "com.mx", "com.ar",
+    "co.za", "com.tr", "com.pl", "com.ru", "co.il",
+})
+
+
+def _wildcard_base_is_registrable(rest):
+    """True when post-star text anchors at a registrable domain.
+
+    ``*.acme.com`` and ``*.example.co.uk`` pass; ``*.com``, ``*.co.uk``
+    and ``*com`` fail. Glued forms (``*-vpn.8x8.com``) pass on their
+    dotted remainder, which endswith-matching keeps narrow.
+    """
+    cand = (rest or "").lstrip("-.").lower().rstrip(".")
+    if not cand or ".." in cand:
+        return False
+    labels = [part for part in cand.split(".") if part]
+    if len(labels) != len(cand.split(".")) or len(labels) < 2:
+        return False
+    if cand in _MULTI_LABEL_PUBLIC_SUFFIXES:
+        return False
+    if ".".join(labels[-2:]) in _MULTI_LABEL_PUBLIC_SUFFIXES and len(labels) < 3:
+        return False
+    return True
+
+
 def canonicalize_asset(identifier, raw_type):
     """Canonicalize one scope identifier + type.
 
@@ -1091,6 +1136,10 @@ def canonicalize_asset(identifier, raw_type):
     """
     raw = (identifier or "").strip()
     if not raw:
+        return "", "other", 0, False
+    # No legitimate scope identifier contains whitespace or control
+    # characters; accepting them lets one row export as several lines.
+    if any(ord(ch) < 32 or ord(ch) == 127 or ch.isspace() for ch in raw):
         return "", "other", 0, False
     atype = canonicalize_asset_type(raw_type)
     lowered = raw.lower().rstrip(".")
@@ -1146,6 +1195,8 @@ def canonicalize_asset(identifier, raw_type):
             return "", "other", 0, False
         rest = rest.lstrip(".")
         if not rest or "*" in rest or " " in rest:
+            return "", "other", 0, False
+        if not _wildcard_base_is_registrable(rest):
             return "", "other", 0, False
         # Glued form (*-prefix.host) keeps its literal post-star shape.
         host = "*." + rest if not rest.startswith("-") else "*" + rest
