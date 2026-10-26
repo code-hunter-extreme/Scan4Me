@@ -32,7 +32,7 @@ from scan4me_pkg.fx_rates import to_usd as _fx_to_usd
 from scan4me_pkg.fx_rates import FX_TO_USD as _STATIC_FX_TO_USD
 
 REPO_ROOT = Path(__file__).resolve().parent
-DB_PATH = REPO_ROOT / "scan4me.db"
+DB_PATH = Path(os.environ.get("SCAN4ME_DB_PATH") or REPO_ROOT / "scan4me.db")
 CONFIG_PATH = REPO_ROOT / "config.json"
 CONFIG_EXAMPLE_PATH = REPO_ROOT / "config.example.json"
 CACHE_DATA_DIR = REPO_ROOT / "data_cache"
@@ -4430,7 +4430,12 @@ def scope_match(target, asset_identifier, is_wildcard):
         rest = rule[1:]
         if not rest or "*" in rest:
             return False
-        return t.endswith(rest)
+        if not t.endswith(rest):
+            return False
+        # Trio parity with Oracle's gate: '*' covers a single label
+        # segment (no dots), never a multi-label prefix.
+        head = t[: -len(rest)]
+        return bool(head) and "." not in head
     return False
 
 
@@ -4488,6 +4493,7 @@ def cmd_check(args):
         JOIN programs p ON a.program_id = p.id
         WHERE a.deleted_timestamp=0 AND a.eligible_for_submission=1
           AND COALESCE(p.deleted_timestamp, 0)=0
+          AND COALESCE(p.submission_state, 'open')='open'
     """
     ).fetchall()
     in_scope = [
@@ -4578,6 +4584,19 @@ def _export_blocked_by_oos(cur, program_id, identifier, is_wildcard, cache):
             continue
         if asset_rule == oos_rule:
             return True
+        # IP networks: any overlap between an exported CIDR and an OOS
+        # network/address is a carve a plain list cannot express.
+        try:
+            _asset_net = ipaddress.ip_network(asset_rule, strict=False)
+        except ValueError:
+            _asset_net = None
+        if _asset_net is not None:
+            try:
+                _oos_net = ipaddress.ip_network(oos_rule, strict=False)
+            except ValueError:
+                _oos_net = None
+            if _oos_net is not None and _asset_net.overlaps(_oos_net):
+                return True
         # Concrete exported asset contained in the OOS rule.
         if scope_match(identifier, oos_id, oos_wild_flag) or _ip_matches_rule(
             identifier, oos_id

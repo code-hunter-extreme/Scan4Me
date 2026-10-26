@@ -3369,3 +3369,46 @@ def test_authenticated_fetchers_support_rate_limit_delay(monkeypatch):
     assert "auth_delay" in sync_sig.parameters
     assert sync_sig.parameters["auth_delay"].default == 1.0
 
+
+
+# ── Phase E: program-state + export CIDR carve ──────────────────────
+
+def test_cmd_check_closed_program_not_authorized(tmp_path, monkeypatch, capsys):
+    """A program whose submissions are closed must not authorize targets."""
+    conn = _temp_db(tmp_path / "t.db")
+    pid = _seed_program(conn, "hackerone", "Acme", "acme")
+    conn.execute("UPDATE programs SET submission_state='closed' WHERE id=?", (pid,))
+    _add_asset(conn, pid, "api.acme.com")
+    out = _run_check(tmp_path, monkeypatch, capsys, conn, "api.acme.com")
+    assert "NOT IN KNOWN SCOPE" in out
+    assert "AUTHORIZED IN-SCOPE" not in out
+
+
+def test_cmd_export_suppresses_cidr_touched_by_oos_carve(tmp_path, monkeypatch, capsys):
+    """An in-scope CIDR overlapped by an OOS carve must not reach a plain list."""
+    conn = _temp_db(tmp_path / "t.db")
+    pid = _seed_program(conn, "hackerone", "Acme", "acme")
+    _add_asset(conn, pid, "10.0.0.0/8")
+    _add_asset(conn, pid, "192.168.0.0/16")
+    _add_oos(conn, pid, "10.1.0.0/16")
+    _add_oos(conn, pid, "192.168.4.4")
+    out = _run_export(tmp_path, monkeypatch, capsys, conn, [pid])
+    assert "10.0.0.0/8" not in out
+    assert "192.168.0.0/16" not in out
+
+
+def test_db_path_env_override(tmp_path):
+    import os, subprocess, sys
+    target = tmp_path / "custom.db"
+    code = "import scan4me; print(scan4me.DB_PATH)"
+    out = subprocess.run([sys.executable, "-c", code], cwd=str(Path(__file__).parent.parent),
+                         env={**os.environ, "SCAN4ME_DB_PATH": str(target)},
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr[-500:]
+    assert str(target) in out.stdout
+
+
+def test_scope_match_glued_wildcard_single_label_only():
+    # Trio parity with Oracle gate: '*' covers one label segment, no dots.
+    assert scan4me.scope_match("a.b-vpn.8x8.com", "*-vpn.8x8.com", True) is False
+    assert scan4me.scope_match("x-vpn.8x8.com", "*-vpn.8x8.com", True) is True
