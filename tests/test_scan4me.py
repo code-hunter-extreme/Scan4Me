@@ -2049,6 +2049,49 @@ def test_cmd_check_caps_at_ten_matches(tmp_path, monkeypatch, capsys):
     assert "matches 10 program(s)" in out
 
 
+def test_cmd_check_duplicate_record_oos_wins_over_mirror(tmp_path, monkeypatch, capsys):
+    """G7: same program duplicated as platform-native + PDPrograms mirror.
+
+    The mirror lists matomo.org in-scope; the native HackerOne record
+    lists it out-of-scope. The native exclusion must win — authorizing
+    off the mirror row alone is the live-DB failure mode.
+    """
+    conn = _temp_db(tmp_path / "t.db")
+    native = _seed_program(conn, "HackerOne", "Matomo", "matomo")
+    mirror = _seed_program(conn, "PDPrograms", "Matomo", "matomo")
+    _add_oos(conn, native, "matomo.org")
+    _add_asset(conn, mirror, "matomo.org")
+    out = _run_check(tmp_path, monkeypatch, capsys, conn, "matomo.org")
+    assert "NOT IN KNOWN SCOPE" in out
+    assert "AUTHORIZED IN-SCOPE" not in out
+
+
+def test_cmd_check_same_name_different_handle_not_linked(tmp_path, monkeypatch, capsys):
+    """A bare name collision (different handle/URL) is not a duplicate:
+    its exclusion must not suppress the other program's match."""
+    conn = _temp_db(tmp_path / "t.db")
+    pa = _seed_program(conn, "hackerone", "Acme", "acme-one")
+    pb = _seed_program(conn, "bugcrowd", "Acme", "acme-two")
+    _add_oos(conn, pa, "api.acme.com")
+    _add_asset(conn, pb, "api.acme.com")
+    out = _run_check(tmp_path, monkeypatch, capsys, conn, "api.acme.com")
+    assert "AUTHORIZED IN-SCOPE" in out
+
+
+def test_cmd_export_duplicate_record_oos_blocks_mirror_asset(tmp_path, monkeypatch, capsys):
+    """G7 export: a mirror asset excluded by the native duplicate's OOS
+    list must not be emitted as an authorized target."""
+    conn = _temp_db(tmp_path / "t.db")
+    native = _seed_program(conn, "HackerOne", "Matomo", "matomo")
+    mirror = _seed_program(conn, "PDPrograms", "Matomo", "matomo")
+    _add_oos(conn, native, "matomo.org")
+    _add_asset(conn, mirror, "matomo.org")
+    _add_asset(conn, mirror, "innocraft.cloud")
+    out = _run_export(tmp_path, monkeypatch, capsys, conn, [mirror])
+    assert "matomo.org" not in out
+    assert "innocraft.cloud" in out
+
+
 # ── cmd_check / cmd_export: eligibility flags (Greptile PR#2 issue 3) ──────────
 
 

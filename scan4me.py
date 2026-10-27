@@ -4477,6 +4477,60 @@ def clean_asset_identifier(value):
     return val.lstrip(".").rstrip("/")
 
 
+def _program_identity_keys(name, handle, url):
+    """Strong identity keys linking duplicate rows of one program.
+
+    The same program can exist as a platform-native record and as a
+    PDPrograms mirror row (different program_id, disjoint scope data).
+    Two rows are duplicates when they share a normalized program URL,
+    or the same normalized (name, handle) pair. A bare name collision
+    alone never links rows.
+    """
+    keys = set()
+    u = re.sub(r"^https?://", "", (url or "").strip().lower())
+    if u.startswith("www."):
+        u = u[4:]
+    u = u.rstrip("/")
+    if u:
+        keys.add(("url", u))
+    name_norm = re.sub(r"[^a-z0-9]", "", (name or "").lower())
+    handle_norm = (handle or "").strip().lower()
+    if name_norm and handle_norm:
+        keys.add(("namehandle", name_norm, handle_norm))
+    return keys
+
+
+def _sibling_program_ids(cur, program_id, cache=None):
+    """All live duplicate program ids for program_id (including itself).
+
+    Out-of-scope authority must union across duplicates: an exclusion
+    recorded on the platform-native row has to defeat an in-scope
+    asset on its PDPrograms mirror (G7 — the mirror has no OOS list).
+    """
+    if cache is not None and program_id in cache:
+        return cache[program_id]
+    row = cur.execute(
+        "SELECT id, name, handle, url FROM programs WHERE id=?", (program_id,)
+    ).fetchone()
+    ids = {program_id}
+    if row is not None:
+        my_keys = _program_identity_keys(row["name"], row["handle"], row["url"])
+        if my_keys:
+            for other in cur.execute(
+                "SELECT id, name, handle, url FROM programs "
+                "WHERE COALESCE(deleted_timestamp, 0)=0 AND id<>?",
+                (program_id,),
+            ).fetchall():
+                if _program_identity_keys(
+                    other["name"], other["handle"], other["url"]
+                ) & my_keys:
+                    ids.add(other["id"])
+    result = tuple(sorted(ids))
+    if cache is not None:
+        cache[program_id] = result
+    return result
+
+
 def cmd_check(args):
     conn = get_db()
     ensure_schema(conn)
@@ -4504,18 +4558,23 @@ def cmd_check(args):
 
     # Live out-of-scope exclusions win over an in-scope wildcard: a target that
     # matches an explicit oos_assets rule for the same program is NOT authorized.
+    # Exclusions union across duplicate rows of the program (G7): the
+    # platform-native record's OOS list defeats its PDPrograms mirror.
     # Cache the verdict per program_id — several in-scope assets can belong to
     # one program, and the exclusion set is identical for all of them.
     oos_cache = {}
+    sibling_cache = {}
 
     def _is_oos(program_id) -> bool:
         if program_id in oos_cache:
             return oos_cache[program_id]
         verdict = False
+        sibling_ids = _sibling_program_ids(cur, program_id, sibling_cache)
+        placeholders = ",".join("?" * len(sibling_ids))
         for row in cur.execute(
             "SELECT asset_identifier, is_wildcard FROM oos_assets "
-            "WHERE program_id=? AND deleted_timestamp=0",
-            (program_id,),
+            f"WHERE program_id IN ({placeholders}) AND deleted_timestamp=0",
+            sibling_ids,
         ).fetchall():
             if scope_match(target, row["asset_identifier"], row["is_wildcard"]) or (
                 _ip_matches_rule(target, row["asset_identifier"])
@@ -4564,10 +4623,15 @@ def _export_blocked_by_oos(cur, program_id, identifier, is_wildcard, cache):
     Exclusions remain available with full fidelity through the DB API.
     """
     if program_id not in cache:
+        # G7: exclusions union across duplicate rows of the program —
+        # a mirror asset must not be emitted when the platform-native
+        # duplicate lists it (or carves it) out of scope.
+        sibling_ids = _sibling_program_ids(cur, program_id)
+        placeholders = ",".join("?" * len(sibling_ids))
         cache[program_id] = cur.execute(
             "SELECT asset_identifier, is_wildcard FROM oos_assets "
-            "WHERE program_id=? AND deleted_timestamp=0",
-            (program_id,),
+            f"WHERE program_id IN ({placeholders}) AND deleted_timestamp=0",
+            sibling_ids,
         ).fetchall()
     asset_rule, _, asset_wild, asset_ok = canonicalize_asset(
         identifier, "wildcard" if is_wildcard else "url"
